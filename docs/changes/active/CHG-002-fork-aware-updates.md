@@ -8,8 +8,8 @@
 | # | Phase | Status | Verification gate |
 | --- | --- | --- | --- |
 | 1 | Explicit fork source and branch-channel discovery | done (`cargo test --offline --locked update && sh scripts/check-records.sh`: 24 filter matches and 73 record tests passed in the isolated Rust 1.89/Node 22 container; `git diff --check` passed) | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
-| 2 | Stage and verify candidates without changing the live checkout | in-progress | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
-| 3 | Serialized promotion and explicit ticker recovery | pending | `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; transactional failure matrix passes |
+| 2 | Stage and verify candidates without changing the live checkout | done (`cargo test --offline --locked update && cargo test --offline --locked --test cli && sh scripts/check-records.sh`: 41 filter matches, 4 CLI tests and 73 record tests passed; durable scratch smoke gate passed; `git diff --check` passed) | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
+| 3 | Serialized promotion and explicit ticker recovery | in-progress | `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; transactional failure matrix passes |
 | 4 | Fork documentation, current CAP and release integration | pending | `sh scripts/check.sh && git diff --check` exits 0; disposable install/update smoke and provenance review pass |
 
 ## Applicability and decision boundary
@@ -189,12 +189,13 @@ reports the verification result, then cleans it up. It must not promote, replace
 the installed binary, change the live checkout, persist selection or act as an
 automatic fallback from either release update or `--check`.
 
-**Current progress:** the stage-only candidate foundation is implemented and
-verified without promotion. It rejects incomplete/mixed options, dirty live state,
-source mismatch, failed build, candidate version/provenance mismatch and a
-non-runnable candidate; it preserves the live checkout and removes scratch before
-returning. Phase 2 remains in-progress for its additional collision, timeout,
-real-build and post-verification-race hardening matrix.
+**Implementation evidence:** stage-only candidate verification rejects
+incomplete/mixed options, dirty or unsafe live state, source mismatch, failed
+build, candidate version/provenance mismatch, non-runnable candidates, timeouts
+and post-verification artifact changes. It preserves the live checkout and
+removes scratch before returning. The durable manual smoke gate below verifies a
+real local candidate build/probe in the reviewed isolated container. No promotion
+behaviour is implemented in this phase.
 
 1. Add RED tests using temporary local Git repositories/remotes and synthetic
    installer processes; no network credentials or active installation.
@@ -209,9 +210,61 @@ real-build and post-verification-race hardening matrix.
    reviewed image version/digest, least necessary mounts and UID handling.
    Do not ship an automatic Alpine/Linux binary fallback on macOS.
 5. Add a scratch integration harness for candidate staging and cleanup. Document
-   the exact command in this phase and include it in the complete gate once added.
+   the exact command in this phase. Keep it an explicit manual phase gate when
+   inclusion in the complete gate would require Docker.
 
 **Verification gate:** `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases above pass.
+
+### Durable scratch smoke gate
+
+From the repository root, run exactly:
+
+```sh
+sh scripts/test-candidate-smoke.sh
+sh scripts/check-candidate-smoke.sh
+```
+
+Prerequisites: Linux, non-root host UID/GID, `/usr/bin/docker` with access to
+`/var/run/docker.sock`, and `TMPDIR` naming an existing user-owned scratch
+directory outside (and not containing) the repository. The already-reviewed
+local image must exist as
+`sha256:32083d2ba467a8af4f60e97857f7e50f7dc74c7633a670b4963bb425f8d18237`
+(Rust/Cargo 1.89.0, Node 22.23.3, rsync 3.2.7). The harness never pulls/builds
+an image or installs tooling. It rejects arguments and inherited Docker
+host/context/config/TLS overrides; it never reads the host Docker configuration.
+
+The only host mounts are the read-only repository and a fresh private scratch
+directory. Both container stages run as the host UID/GID with a read-only root
+filesystem and clean environment; HOME, CARGO_HOME, target and TMPDIR are under
+scratch. No host home, credentials or active installation is mounted. A separate
+network-enabled `cargo fetch --locked` populates the fresh dependency cache;
+compilation, fixtures, both exact-name native candidate smoke tests and record
+checks run with `--network none` and Cargo offline. Missing smoke tests fail
+rather than silently accepting zero matches. Exit/signal traps remove the
+container and scratch (uncatchable SIGKILL/host failure is outside that guarantee).
+No install, link, doctor, update or promotion command is invoked.
+
+This is an **explicit manual phase gate**: `scripts/check.sh` is intentionally
+unchanged so Docker and network-dependent cold-cache acquisition do not become
+mandatory normal-gate requirements. This harness is not the full phase-2 gate
+and does not change any phase status or CAP.
+
+TDD evidence for the harness boundary:
+
+- RED: `sh scripts/test-candidate-smoke.sh` exited 1 before implementation:
+  `not ok - unsafe mount override (expected safety refusal, exit 2)`;
+  the following shell diagnostic identified the missing harness file.
+- GREEN: the same fixtures exited 0, reporting `ok` for unsafe mount override,
+  unsafe runner override, remote Docker runner, inherited Docker context, host
+  Docker credentials and repository scratch mount. They also passed inside the
+  approved isolated runner.
+- `sh scripts/check-candidate-smoke.sh` exited 0. Existing tests
+  `update::tests::candidate_native_smoke_builds_and_cleans_without_live_mutation`
+  and `update::tests::candidate_native_smoke_invalid_executable_cleans_without_success`
+  each reported `1 passed; 0 failed; 0 ignored; 0 measured; 357 filtered out`.
+  Record checks reported 73 passed, 0 failed and
+  `Product record check passed: 4 capabilities, 3 change records.` The harness
+  ended with `candidate-smoke: PASS`.
 
 ## Phase 3 — Serialized promotion and explicit ticker recovery
 
