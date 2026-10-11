@@ -1,3 +1,39 @@
+# Herdr Projects — forgegod fork
+
+Coordinate a project through one agent conversation, parallel worker threads,
+and shared project context in Herdr.
+
+This is [forgegod/eliasstravik-herdr-projects](https://github.com/forgegod/eliasstravik-herdr-projects),
+a fork of [eliasstravik/herdr-projects](https://github.com/eliasstravik/herdr-projects).
+Original attribution and [MIT license](LICENSE) are retained. The product guide
+below preserves upstream's installation recipes; commands naming
+`eliasstravik/herdr-projects` install upstream, not this fork.
+
+This fork adopts repository-owned [architecture](docs/architecture.md),
+[current capability records](docs/product/index.md), and
+[planned change records](docs/changes/README.md). Hermes integration, reconciled
+OMP input detection, and an explicit fork-branch updater are planned, not
+implemented. The current updater
+checks release versions from the installation's origin; same-version commits
+on this fork are not a reliable update channel yet. See
+[CHG-002](docs/changes/active/CHG-002-fork-aware-updates.md).
+
+For development, install Rust 1.89+, Node 22+, Git and rsync, then run
+`sh scripts/check.sh` (tests, record validation and release build; no install).
+See [development and verification](docs/development.md). Node is development-only;
+the product remains a Rust binary.
+
+## Hermes Agent integration
+
+Read the [Hermes operator guide](docs/hermes-agent.md) for the current support
+matrix, how the architecture fits together, dedicated-profile setup, correct
+`HERMES_HOME`/`HOME`/working-directory handling, and the comparison with Hermes
+Bot Mode and Kanban worker lanes. Profile preparation works independently of
+this fork; full hooks, safe profile binding and classic-CLI nudges remain
+[CHG-001 planned work](docs/changes/active/CHG-001-hermes-agent-integration.md).
+Do not globally share one worker's `HERMES_HOME` across concurrent agents or
+assume that Herdr and Kanban coordinate ownership of the same task/profile.
+
 <p align="center"><img src="https://img.shields.io/badge/Herdr%20Projects-Projects%20for%20Herdr-2ea44f?style=flat-square&labelColor=24292f" alt="Herdr Projects | Projects for Herdr" /></p>
 
 <h3 align="center">Run a whole project across your coding agents without handing each one its task or keeping track of who is doing what</h3>

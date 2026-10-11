@@ -2,6 +2,13 @@
 
 Install the plugin, run `configure` once, create a project, and talk to its coordinator.
 
+**Using Hermes Agent?** Read the [Hermes operator guide](hermes-agent.md) first.
+Generic agent-kind support does not include Hermes hook/skill installation,
+profile-reuse protection or automatic nudges at this baseline. The guide covers
+profile preparation, `HERMES_HOME`, and the planned integration; do not run a
+guessed Hermes configure command. Installation recipes below name upstream,
+not this fork; see the [fork notice](../README.md).
+
 ## 1. Check the prerequisites
 
 - macOS or Linux, and [Herdr](https://herdr.dev) 0.9.1 or newer. Check with `herdr status`: both the client and the running server must be 0.9.1 or newer. After `herdr update`, a server that was already running stays on the old version until you restart it, and `herdr plugin link` or `install` then fails with `plugin_requires_newer_herdr`.

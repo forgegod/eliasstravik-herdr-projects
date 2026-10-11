@@ -2,6 +2,12 @@
 
 How Herdr Projects works, what it writes where, what its safety settings do and don't stop, and how to run threads on other machines.
 
+For Hermes-specific profile/home selection, tool cwd, permissions, diagnostics
+and Bot Mode/Kanban coexistence, use the [Hermes operator guide](hermes-agent.md).
+Those systems do not currently share a dispatcher, profile-use lock or completion
+protocol with Herdr. The guide separates current support from CHG-001's planned
+integration; it does not make Bot/cron/Kanban writers safe to share a live worker home.
+
 ## How it works
 
 - **It relies on Herdr and nothing else.** No other plugin is needed or called. Pull requests open in your browser, text files open in a new Herdr tab running `$EDITOR`.
