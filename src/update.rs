@@ -351,8 +351,10 @@ pub fn stage_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<Stri
     let verification = (|| -> Result<()> {
         let selected = select_branch(ctx, repository, reference, Some(scratch.path()))?;
         let staged = stage_candidate(ctx.runner, selected.install.root(), &selected.repository, &selected.commit, scratch.path())?;
-        staged.build_native(ctx.runner, &selected.repository, &selected.commit)?;
+        let (binary, checksum) = staged.build_native(ctx.runner, &selected.repository, &selected.commit)?;
         staged.check_live_before_promotion(ctx.runner)?;
+        // Keep the verified digest across the final guard's external reads.
+        if candidate_checksum(&binary)? != checksum { bail!("candidate changed after verification"); }
         Ok(())
     })();
     // Explicit close propagates cleanup failures rather than reporting success
@@ -529,7 +531,7 @@ impl StagedCandidate {
         Ok(())
     }
 
-    fn build_native(&self, runner: &dyn Runner, repository: &str, commit: &str) -> Result<PathBuf> {
+    fn build_native(&self, runner: &dyn Runner, repository: &str, commit: &str) -> Result<(PathBuf, Vec<u8>)> {
         if repository != self.repository || commit != self.commit {
             bail!("candidate source/commit provenance mismatch");
         }
@@ -573,7 +575,7 @@ impl StagedCandidate {
         if !candidate_git(runner, self.scratch.path(), &self.source, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
             bail!("candidate source changed during build");
         }
-        Ok(binary)
+        Ok((binary, checksum))
     }
 }
 
@@ -827,6 +829,94 @@ mod tests {
         }
     }
 
+    fn stage_completion_fault(case: &'static str) {
+        use std::os::unix::fs::PermissionsExt;
+        let (live, _remote, _scratch, commit, staging) = staging_fixture();
+        std::fs::remove_file(live.path().join("notes")).unwrap();
+        std::fs::write(live.path().join(".git/info/exclude"), "/target/\n").unwrap();
+        let before = checkout_snapshot(live.path());
+        let runner = FakeRunner::new();
+        runner.on("plugin list", ok(&list(r#"{"kind":"local"}"#).replace("/p/root", live.path().to_str().unwrap())));
+        runner.on("rev-parse --show-prefix", ok(""));
+        runner.on("symbolic-ref --quiet HEAD", ok("refs/heads/main\n"));
+        runner.on("branch.main.merge", ok("refs/heads/main\n"));
+        runner.on("branch.main.remote", ok("origin\n"));
+        runner.on("remote.origin.url", ok("https://github.com/forgegod/eliasstravik-herdr-projects.git\n"));
+        runner.on("ls-remote", ok(&format!("{commit}\trefs/heads/main\n")));
+        let built = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let seen = built.clone();
+        runner.on_fn(|c| c.program == "cargo", move |cmd| {
+            let target = PathBuf::from(cmd.args.last().unwrap());
+            *seen.borrow_mut() = Some(target.parent().unwrap().to_path_buf());
+            std::fs::create_dir_all(target.join("release"))?;
+            std::fs::write(target.join("release/herdr-projects"), "synthetic candidate")?;
+            Ok(ok(""))
+        });
+        runner.on_fn(|c| c.args == ["--version"], move |_| Ok(ok(&format!("herdr-projects 0.2.34+{}.123\n", &commit[..7]))));
+        let injected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let did_inject = injected.clone();
+        let stage_path = built.clone();
+        runner.on_fn(|c| c.program == "git", move |cmd| {
+            let out = staging.run(cmd)?;
+            // The post-build guard's last Git read runs after native verification.
+            if cmd.args.iter().any(|a| a == "ls-tree") {
+                if let Some(root) = stage_path.borrow().as_ref() {
+                    assert!(out.success());
+                    let binary = root.join("target/release/herdr-projects");
+                    match case {
+                        "tamper" => std::fs::write(binary, "tampered after native verification")?,
+                        "missing" => std::fs::remove_file(binary)?,
+                        "symlink" => {
+                            std::fs::remove_file(&binary)?;
+                            std::os::unix::fs::symlink(root.join("source/Cargo.toml"), binary)?;
+                        }
+                        "cleanup" => std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500))?,
+                        _ => unreachable!(),
+                    }
+                    did_inject.set(true);
+                }
+            }
+            Ok(out)
+        });
+        let home = tempfile::tempdir().unwrap();
+        let env = paths::Env::for_test(home.path(), &[("HERDR_SOCKET_PATH", "/synthetic/socket")]);
+        let ctx = Ctx { env: &env, root: home.path().join("projects"), config_dir: env.config_dir(), runner: &runner, detached_ticker: false };
+        let result = stage_branch(&ctx, "forgegod/eliasstravik-herdr-projects", "main");
+        let scratch = built.borrow().clone().expect("candidate was not built");
+        let outer = scratch.parent().unwrap();
+        let cleanup_failed = outer.exists();
+        // Repair only disposable fault-injection permissions, even on RED.
+        if case == "cleanup" && scratch.exists() {
+            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(outer).unwrap();
+        }
+        assert!(injected.get(), "fault did not reach post-verification boundary");
+        assert_eq!(before, checkout_snapshot(live.path()), "live files/index/binary changed: {case}");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        for forbidden in ["plugin install", "scripts/install", "doctor", "ticker", "docker", "--tags"] {
+            assert_eq!(runner.count(forbidden), 0, "unexpected {forbidden}");
+        }
+        if case == "cleanup" {
+            assert!(cleanup_failed, "cleanup failure was not injected");
+        } else {
+            assert!(!cleanup_failed, "candidate scratch survived verification failure");
+        }
+        let report = match &result { Ok(report) => report.clone(), Err(error) => error.to_string() };
+        assert!(!report.contains("candidate verification: passed"), "{case}: {report}");
+        assert!(result.is_err(), "stage accepted {case}");
+        assert!(report.contains(if case == "cleanup" { "candidate cleanup failed" } else { "candidate verification failed" }), "{report}");
+    }
+
+    #[test]
+    fn candidate_stage_completion_rejects_post_verification_artifact_race() {
+        for case in ["tamper", "missing", "symlink"] { stage_completion_fault(case); }
+    }
+
+    #[test]
+    fn candidate_stage_completion_reports_cleanup_failure_truthfully() {
+        stage_completion_fault("cleanup");
+    }
+
     #[test]
     fn candidate_staging_ignored_collision_guard_is_read_only() {
         let mut accepted = Vec::new();
@@ -991,7 +1081,7 @@ mod tests {
             let result = staged.build_native(&runner, repository, selected);
             if case == "valid" {
                 assert!(result.is_ok(), "valid native candidate rejected: {result:?}");
-                assert!(result.unwrap().is_file());
+                assert!(result.unwrap().0.is_file());
             } else {
                 assert!(result.is_err(), "accepted {case}");
             }
