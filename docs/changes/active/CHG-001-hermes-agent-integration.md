@@ -120,14 +120,11 @@ phase requires without an additional launch strategy or an upstream change:
   joins command text and sends `PaneSendInput` with Enter, not a process spawn
   carrying a terminal-identity precondition. No shell-input workaround was used.
 
-**Operator decision required:** authorize a Hermes-specific fresh-process/pane
-launch lifecycle (including its effect on worktree root panes and restart pane
-reuse), or require the existing-pane lifecycle and make guarded per-launch
-environment support in Herdr an upstream prerequisite. The former can be
-investigated within this repository using the documented
-[layout.apply argv/env contract](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.3/docs/next/website/src/content/docs/socket-api.mdx),
-but is not yet implemented or live-verified. Do not weaken identity checks or
-silently fall back to the inherited home while deciding.
+**Selected boundary:** the operator requires the existing-pane lifecycle and
+treats guarded per-launch environment support in Herdr as an upstream
+prerequisite. CHG-001 remains blocked until that prerequisite is available and
+can be verified; no Hermes-specific fresh-process/pane lifecycle is authorized.
+Do not weaken identity checks or silently fall back to the inherited home.
 
 Environment discovery also found no `cargo`/`rustc` on PATH or executable Cargo
 at `$HOME/.cargo/bin/cargo`; Docker and the `rust:1.89-bookworm` image are
