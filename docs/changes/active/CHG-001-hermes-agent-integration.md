@@ -1,13 +1,13 @@
 # CHG-001 — Profile-safe Hermes Agent integration
 
-**Status:** planned
+**Status:** blocked
 **External request:** Direct operator request: Adopt the ../ai-software-blueprint/ to this project. Convert the findings and recommendation into CHG according to the phased-plan-design skill. Discuss with the operator how the profile concept of Hermes Agent comply with your findings regarding the architecture
 **Impacts:** CAP-001, CAP-002, CAP-003
 **Baseline:** `4e4548c` — release `0.2.34`; blueprint adoption adds records/tooling only, not this feature
 
 | # | Phase | Status | Verification gate |
 | --- | --- | --- | --- |
-| 1 | Explicit Hermes profile binding and safe launch/resume | pending | `cargo test --locked profiles && cargo test --locked paths && cargo test --locked scenarios && sh scripts/check-records.sh` exits 0; profile race/resume acceptance cases below pass |
+| 1 | Explicit Hermes profile binding and safe launch/resume | in-progress | `cargo test --locked profiles && cargo test --locked paths && cargo test --locked scenarios && sh scripts/check-records.sh` exits 0; profile race/resume acceptance cases below pass |
 | 2 | Reversible profile-scoped skill and startup adapter installation | pending | `cargo test --locked && python3 -m unittest discover -s tests/hermes -v && sh scripts/check-records.sh` exits 0; isolated install round-trip passes |
 | 3 | Managed-pane progress, in-turn reminders and session isolation | pending | `cargo test --locked progress && cargo test --locked --test cli && python3 -m unittest discover -s tests/hermes -v && sh scripts/check-records.sh` exits 0; live managed/unmanaged checks pass |
 | 4 | Classic Hermes CLI draft-safe brief and nudge delivery | pending | `cargo test --locked prompt_box && cargo test --locked brief && cargo test --locked scenarios && sh scripts/check-records.sh` exits 0; captured-screen and live nudge checks pass |
@@ -15,7 +15,7 @@
 
 ## Request and approved scope
 
-The preceding request was: “This project have support for Codex, Claude skills/hooks but missing them for Hermes Agent. Can you analyse that first”. This CHG converts that analysis into planned material work; the operator has not asked to implement these phases yet.
+The preceding request was: “This project have support for Codex, Claude skills/hooks but missing them for Hermes Agent. Can you analyse that first”. This CHG converts that analysis into material work. The operator authorized phased implementation and selected phase 1, “Explicit Hermes profile binding and safe launch/resume”, for this execution cycle. Later phases remain pending.
 
 On 2026-10-11 the operator chose:
 
@@ -95,6 +95,51 @@ Final documentation acceptance:
 8. Fulfil the phase-1 documentation row. Document lack of shared leasing with Bot Chat, cron/gateway and Kanban writers. Add negative launch tests for unsupported inherited Kanban task/run/claim/descendant contexts; diagnose/refuse rather than stripping lineage or inventing a lifecycle bridge.
 
 **Verification gate:** `cargo test --locked profiles && cargo test --locked paths && cargo test --locked scenarios && sh scripts/check-records.sh` exits 0; profile race/resume acceptance cases above pass. Record focused test names and counts so an empty Cargo filter cannot masquerade as evidence.
+
+### Phase 1 execution blocker — launch transport decision
+
+Phase 1 began from clean `main` at `b59f18df7a42651980d975de9d4ccb650549dd71`.
+No implementation or regression tests have been added; the phase is not done.
+The existing-pane launch transport cannot carry the explicit environment this
+phase requires without an additional launch strategy or an upstream change:
+
+- Installed `herdr --version` reports `herdr 0.9.3`. Its `agent start --help`
+  accepts kind, pane, timeout and agent arguments, but no environment override.
+  The pinned [AgentStartParams schema](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.3/src/api/schema/agents.rs)
+  likewise has only `name`, `kind`, `pane_id`, `args` and `timeout_ms`.
+- `src/herdr.rs::agent_start`, coordinator tab/reuse launches and
+  `src/ticker.rs::launch_pass` use that transport. Setting environment on
+  the client command is not a per-agent environment transfer into an existing
+  server-owned shell. `open --here` instead uses `Runner::run_foreground` and
+  can supply an explicit child environment; that does not solve worker launch.
+- `herdr workspace create --help` and `herdr tab create --help` expose `--env`;
+  `herdr worktree create --help` and `herdr worktree open --help` do not. New-tab
+  environment support alone does not cover recorded-pane/worktree reuse.
+- `pane run` is not a guarded replacement for `agent start`: its pinned
+  [implementation](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.3/src/cli/pane.rs)
+  joins command text and sends `PaneSendInput` with Enter, not a process spawn
+  carrying a terminal-identity precondition. No shell-input workaround was used.
+
+**Operator decision required:** authorize a Hermes-specific fresh-process/pane
+launch lifecycle (including its effect on worktree root panes and restart pane
+reuse), or require the existing-pane lifecycle and make guarded per-launch
+environment support in Herdr an upstream prerequisite. The former can be
+investigated within this repository using the documented
+[layout.apply argv/env contract](https://raw.githubusercontent.com/herdrdev/herdr/v0.9.3/docs/next/website/src/content/docs/socket-api.mdx),
+but is not yet implemented or live-verified. Do not weaken identity checks or
+silently fall back to the inherited home while deciding.
+
+Environment discovery also found no `cargo`/`rustc` on PATH or executable Cargo
+at `$HOME/.cargo/bin/cargo`; Docker and the `rust:1.89-bookworm` image are
+available. The documented disposable-container verification route remains an
+alternative, not a reason to waive TDD. RED/GREEN and the full phase gate have
+not run because implementation is paused at this decision. All later phases
+remain pending; no current-state CAP or shipped-behaviour claim changes.
+
+Documentation-only closeout: `sh scripts/check-records.sh && git diff --check`
+exited 0 (73 record tests passed; 4 capabilities and 3 change records validated).
+Applicable AGENTS.md files remain unchanged: ownership, contracts and workflows
+have not changed; this records a blocked decision, not a new launch contract.
 
 ## Phase 2 — Reversible profile-scoped skill and startup adapter installation
 
