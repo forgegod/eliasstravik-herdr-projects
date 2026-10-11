@@ -1,6 +1,6 @@
 # CHG-002 — Fork-aware updates without losing local provenance
 
-**Status:** in-progress
+**Status:** blocked
 **External request:** Direct operator request: because we forked the original project, check if the concept of https://github.com/afloury/herdr-projects/commit/08da209462e736f29b6e9d2325e0cd2b79613f0e could also be applied to this fork and create an appropriate CHR for it -- if applicable
 **Impacts:** CAP-004
 **Baseline:** `4e4548c` — release `0.2.34`; origin `forgegod/eliasstravik-herdr-projects`
@@ -9,7 +9,7 @@
 | --- | --- | --- | --- |
 | 1 | Explicit fork source and branch-channel discovery | done (`cargo test --offline --locked update && sh scripts/check-records.sh`: 24 filter matches and 73 record tests passed in the isolated Rust 1.89/Node 22 container; `git diff --check` passed) | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
 | 2 | Stage and verify candidates without changing the live checkout | done (`cargo test --offline --locked update && cargo test --offline --locked --test cli && sh scripts/check-records.sh`: 41 filter matches, 4 CLI tests and 73 record tests passed; durable scratch smoke gate passed; `git diff --check` passed) | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
-| 3 | Serialized promotion and explicit ticker recovery | in-progress | `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; transactional failure matrix passes |
+| 3 | Serialized promotion and explicit ticker recovery | pending | Operator selects the promotion/confirmation contract below before production edits; then `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0 and transactional failure matrix passes |
 | 4 | Fork documentation, current CAP and release integration | pending | `sh scripts/check.sh && git diff --check` exits 0; disposable install/update smoke and provenance review pass |
 
 ## Applicability and decision boundary
@@ -18,7 +18,7 @@ The requested “CHR” is represented using this repository's canonical CHG rec
 type, not a second record namespace. The fork-update concept applies; the exact
 script is not approved for import. [Review package](../reviews/CHG-002/README.md).
 
-The updater currently discovers origin release tags and compares versions.
+At the baseline, the updater discovers origin release tags and compares versions.
 New commits on the fork's main can remain invisible when the version is
 unchanged. Managed installation source and Git origin can also disagree.
 The reference patch's statement that update always follows upstream is not
@@ -64,8 +64,9 @@ same-version fork commits from release-version updates.
 
 ### Phase 1 contract selection and implementation status
 
-**Execution:** Phase 1 started from clean `main` at `d71286b`. It remains
-in-progress; phases 2–4 remain pending. No phase-completion claim is made.
+**Execution:** Phase 1 started from clean `main` at `d71286b` and is complete;
+its acceptance evidence is below. Phase 2 is also complete. Phase 3 is blocked
+before implementation on the contract decision below; phase 4 remains pending.
 
 Additional direct operator instruction: “If the decision cannot be derived from
 an explicit current repository contract, mark CHG-002 phase 1 blocked with
@@ -125,12 +126,11 @@ not a particular approved interface. Source investigation found:
    report it as `unverified`, never as a verified commit. Neither choice
    authorizes promotion, source switching or installation.
 
-Implementation has started with focused RED→GREEN cycles for the selected
-contract. The phase remains incomplete: equal/ahead/diverged classification must
-not guess from remote SHAs alone when ancestry objects are missing, and any
-necessary object acquisition must be isolated from the live checkout. CAP-004,
-architecture and accepted design decisions remain unchanged until the complete
-behaviour and phase gate are verified.
+Implementation used focused RED→GREEN cycles for the selected contract.
+Equal/ahead/diverged classification must not guess from remote SHAs alone when
+ancestry objects are missing; object acquisition is isolated from the live
+checkout. The implementation evidence below supersedes the initial incomplete
+checkpoint. CAP-004 was updated with the verified check-only behaviour.
 
 ### Phase 1 baseline verification before implementation
 
@@ -175,7 +175,8 @@ behaviour and phase gate are verified.
   byte-for-byte, and each test passed green.
 - The phase gate passed in the isolated Rust 1.89/Node 22 container: 24 `update`
   filter matches and 73 record tests passed. `git diff --check` passed. CAP-004
-  now describes the implemented check-only boundary; later phases remain pending.
+  was updated with the implemented check-only boundary at that gate. Phase 2's
+  subsequent completion and the phase-3 blocker are recorded separately below.
 
 ## Phase 2 — Stage and verify candidates without changing the live checkout
 
@@ -271,6 +272,140 @@ TDD evidence for the harness boundary:
 **Goal:** Promotion has an observable transaction boundary with bounded recovery,
 correct project/config identity and no false success after failed repair/restart.
 
+### Contract decision — blocked before production edits
+
+**Execution:** Blocked. The phase table uses `pending` for phase 3 because no
+implementation is authorized; the CHG status is `blocked`, consistent with
+`docs/changes/README.md`'s phase-status vocabulary. Phases 1–2 retain their
+completed evidence, phase 4 remains pending, and no phase-3 gate has passed.
+
+**Specification scope:** Read the existing update, ticker, repair, installation,
+binary/link and review surfaces before production edits. This is a read-only
+decision pass: it cannot mutate the active installation, ticker, configuration,
+remotes, binaries, network or credentials, and it does not authorize source,
+tests, CAPs, staging or commits. If no current contract defines an explicit
+promotion confirmation, record the resulting decision frontier rather than
+inventing one.
+
+**Finding:** No explicit user-facing branch-promotion command or transaction
+confirmation/commit interface is defined by the current repository contracts.
+The phase's recovery requirements and review recommendations do not select one.
+Inspection baseline: `4f0465cf9ff41f2a991a6d7d3c283109fca825c7` (clean `main`
+before these record edits). Evidence is repository source, not a live-install
+experiment; no updater, ticker, doctor, installer or candidate binary was run.
+
+Source-backed boundaries:
+
+- **CLI and authorization:** `src/cli.rs:286–304,913–928` defines only release
+  update, branch `--check` and branch `--stage`; branch dispatch requires exactly
+  one of the latter two. There is no `--promote`, candidate commit argument,
+  confirmation prompt or transaction receipt interface. CAP-004
+  (`docs/product/capabilities/CAP-004-installation-and-update.md:11–15`) promises
+  no promotion from staging and explicitly disclaims transactional branch updates.
+  `docs/getting-started.md:104–124` and `docs/operations.md:73` describe release
+  updates, not authorization to repurpose bare `update` for branch promotion.
+- **Candidate lifetime:** `src/update.rs:362–380` verifies then deletes scratch
+  before returning; `527–547` makes the candidate private and calls its final
+  guard read-only, not a lock or authorization. A later promotion cannot consume
+  an artifact from today's `--stage`. `383–460,550–597,616–691` reconcile source,
+  ref and managed provenance, verify the immutable candidate and compare live
+  state, but do not persist a promotion plan, acquire installation ownership or
+  define a commit step. The installed commit remains explicitly unverified
+  (`333–338`); checkout HEAD must not become a binary receipt by assumption.
+- **Existing release path:** `src/update.rs:218–258,463–524` stops the ticker,
+  reinstalls through Herdr with a release tag or pulls linked `origin main`,
+  runs the installed binary's `doctor --fix`, then attempts ticker start.
+  It has no branch transaction lock, recoverable receipt or binary rollback
+  protocol. `run_binary` supplies `--root` but does not explicitly bind config
+  identity. Existing internal Herdr `--yes` is not a branch-promotion consent
+  contract. The failure message at `523` can say "ticker was restarted" while
+  appending a start-failed note; phase 3 must not inherit that as success evidence.
+- **Ticker lifecycle:** `src/ticker.rs:32–75,100–169,229–268` owns a lock per
+  projects root, not per installation. Stop requests use a stop file and wait
+  up to 60 seconds for lock release, never signal the displayed PID. Start can
+  return without a ticker when there are no projects, or return after spawning
+  without waiting for readiness. Spawn forwards `--root`, removes pane/session
+  variables and otherwise inherits environment; ticker info has no config
+  identity (`48–56`). A successful start call alone does not prove recovery.
+- **Root/config and repair:** `src/paths.rs:48–50,67–109` distinguishes the
+  resolved executable, project root and HOME-derived project config directory;
+  `src/setup.rs:144–150` separately resolves Herdr config via
+  `HERDR_CONFIG_PATH`/`XDG_CONFIG_HOME`/HOME. There is no global `--config` flag
+  (`src/cli.rs:14–23,639–650`). `src/doctor.rs:49–110,212–231,350–439` can repair
+  priming files, links, configured hooks/skills and sidebar configuration;
+  its healthy result excludes warnings, and CLI failure follows required-check
+  failure (`src/cli.rs:861–865`). Its quiet release probe can contact origin
+  (`src/doctor.rs:88–90`, `src/update.rs:155–171`). Repair is neither read-only
+  nor a reversible binary transaction; restoring a binary cannot undo its writes.
+- **Installation unit and paths:** `src/update.rs:145–175` assumes
+  `<plugin-root>/target/release/herdr-projects`; `src/setup.rs:262–265` locates
+  bundled skills relative to that root. `herdr-plugin.toml:8–13` invokes the
+  installer and starts the binary there. `scripts/install.sh:20–30,53–79,97–122`
+  can build/download, rename the executable and call the link script; its
+  unrecognized-origin release fallback is not approved for branch promotion.
+  `scripts/link-command.sh:18–45` targets Herdr's final managed path rather than
+  its temporary checkout. `src/command_link.rs:15–85` uses XDG_BIN_HOME or
+  HOME/.local/bin and preserves foreign files/live foreign links; startup also
+  calls link repair (`src/cli.rs:888–896`). A binary-only swap does not establish
+  matching source/skills or new managed provenance. Installation relocation,
+  linked versus managed ownership and the promoted artifact set need an
+  explicit contract, not an inferred call to the existing installer.
+- **Review versus approval:** the [source assessment](../reviews/CHG-002/fork-update-assessment.md)
+  pins `08da209462e736f29b6e9d2325e0cd2b79613f0e`, recommends explicit selection,
+  staging, atomic replacement and bounded recovery (`24–66`), and rejects the
+  detached-checkout/ignored-stop/doctor-warning approach. It supplies no approved
+  CLI spelling or confirmation protocol. Its [README](../reviews/CHG-002/README.md)
+  is `review-only`; `docs/design-decisions.md` contains no accepted updater
+  transaction decision. This phase's steps below are safety requirements, not
+  approval of an unspecified interface.
+
+### Alternatives requiring operator selection
+
+**A — Design an explicit promotion confirmation/commit interface.** Add a new,
+opt-in `herdr-projects update --promote --channel branch --repository <owner>/<repo>[/<subdir>] --ref <ref>`
+mode only after approval. This is a proposed command family, not a runnable or
+selected contract. Preserve bare release update and the existing check/stage
+contracts. Explicitly choose how a person authorizes the transaction against
+one immutable candidate and one installation:
+
+- A one-invocation transaction that restages/revalidates, displays its exact
+  source/ref/full commit, installation/binary, root/config identity and repair
+  effects, then requires an affirmative confirmation bound to that plan; or
+- A preview/commit interface with a durable plan/receipt and a separate explicit
+  commit confirmation, with defined expiry, integrity, cleanup and refusal on
+  changed candidate/installation state. This cannot silently turn existing
+  `--stage` into persistent staging.
+
+The operator must select the exact confirmation/commit spelling and whether
+noninteractive confirmation is supported (and how it binds the full commit and
+target). Neither `--promote` alone, an old check/stage success, an inherited
+`--yes`, nor a moving branch name supplies that missing consent. These alternatives
+follow the review's print-before-mutation requirement and the current disposable
+candidate boundary; neither is authorized by it.
+
+**B — Retain stage-only branch behavior pending a future promotion design.**
+Keep the phase-1/2 CLI and cleanup guarantees unchanged, add no promotion command,
+and defer this phase and dependent phase-4 promotion/integration acceptance.
+This is already supported by CAP-004 and `stage_branch`; it permits verification,
+not installation. Do not label stage success as update success, close CHG-002 as
+fully implemented, or use ordinary release update as a branch-promotion fallback.
+
+**Precise operator decision required:** Select A or B. If A, select the
+one-invocation or preview/commit model, approve its exact user-facing confirmation
+syntax and noninteractive policy, and define the transaction's installation
+scope (linked, managed or both; binary-only versus matching plugin assets and
+managed provenance). Approve how project/Herdr config identity is bound across
+old/new executables, whether an initially absent ticker stays absent, what
+constitutes successful restart, and the rollback/degraded-state boundary after
+repair writes. Until these choices are explicit in this CHG, implementation and
+behavior-test design remain blocked; no CLI flags or receipt format are assumed.
+Selecting A authorizes contract specification, not an update of the active install.
+
+### Implementation requirements after the decision
+
+The following requirements remain pending. Refine their RED tests and exact
+transaction states from the selected contract before making production edits.
+
 1. Write RED tests for concurrent updates, stale locks, ticker-stop refusal,
    promotion failure, interrupted promotion, doctor failure, restart failure,
    custom project root/config and moved installation paths.
@@ -289,6 +424,22 @@ correct project/config identity and no false success after failed repair/restart
    update ownership/recovery only as the behaviour becomes implemented.
 
 **Verification gate:** `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; transactional failure matrix above passes.
+
+### Specification-only verification and DOX boundary
+
+Only `sh scripts/check-records.sh` is authorized for this specification pass;
+the implementation gate above is not run or claimed. No source, tests, CAPs,
+installation/configuration, remote, credential or binary changes are authorized.
+`sh scripts/check-records.sh` exited 0: 73 record-validator tests passed, none
+failed, and the tree validated as 4 capabilities / 3 change records. This is
+documentation evidence only, not phase-3 implementation acceptance. No skill
+installation or network retrieval was attempted.
+
+The DOX pass leaves root, `docs/AGENTS.md`, `docs/changes/AGENTS.md` and
+`docs/product/AGENTS.md` unchanged: ownership, workflow and child indexes are
+unchanged. Only this CHG and its status in `docs/changes/README.md` change;
+CAP-004, architecture, accepted decisions and the review package remain unchanged
+because no new behavior or design selection is approved.
 
 ## Phase 4 — Fork documentation, current CAP and release integration
 
