@@ -521,6 +521,7 @@ impl StagedCandidate {
     /// repeat this under installation ownership immediately before promotion.
     fn check_live_before_promotion(&self, runner: &dyn Runner) -> Result<()> {
         let current = live_candidate_state(runner, self.scratch.path(), &self.live)?;
+        check_ignored_candidate_collisions(runner, self.scratch.path(), &self.live, &self.source, &self.commit)?;
         if !self.live_state.status.is_empty() || !current.status.is_empty() {
             bail!("live checkout is dirty or has untracked collisions");
         }
@@ -593,6 +594,19 @@ struct LiveCandidateState {
 
 fn live_candidate_state(runner: &dyn Runner, home: &Path, live: &Path) -> Result<LiveCandidateState> {
     let read = |args: &[&str]| candidate_git(runner, home, live, args);
+    // Porcelain status can hide changes behind assume-unchanged or
+    // skip-worktree. Inspect the whole index without refreshing or clearing it.
+    let index = read(&["ls-files", "-v", "-z", "--", ":/"])?;
+    if index.split('\0').filter(|entry| !entry.is_empty()).any(|entry| !entry.starts_with("H ")) {
+        bail!("live index has unsafe flags or unmerged entries");
+    }
+    // The installed regular binary is expected; redirected output directories
+    // are not. Never follow an ignored symlink when choosing a future output.
+    for directory in [live.join("target"), live.join("target/release")] {
+        if !std::fs::symlink_metadata(directory)?.is_dir() {
+            bail!("live output directory is not a regular directory");
+        }
+    }
     Ok(LiveCandidateState {
         head: read(&["rev-parse", "--verify", "HEAD"] )?,
         branch: read(&["rev-parse", "--abbrev-ref", "HEAD"] )?,
@@ -600,6 +614,26 @@ fn live_candidate_state(runner: &dyn Runner, home: &Path, live: &Path) -> Result
         remotes: read(&["config", "--local", "--no-includes", "--get-regexp", "^remote\\..*\\.url$"] )?,
         binary: candidate_checksum(&binary_in(live))?,
     })
+}
+
+fn check_ignored_candidate_collisions(
+    runner: &dyn Runner, home: &Path, live: &Path, source: &Path, commit: &str,
+) -> Result<()> {
+    let top = candidate_git(runner, home, live, &["rev-parse", "--show-toplevel"])?;
+    let ignored = candidate_git(runner, home, Path::new(&top), &[
+        "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+    ])?;
+    let candidate = candidate_git(runner, home, source, &["ls-tree", "-r", "--name-only", "-z", commit])?;
+    for ignored in ignored.split('\0').filter(|path| !path.is_empty()) {
+        let ignored = Path::new(ignored.trim_end_matches('/'));
+        for path in candidate.split('\0').filter(|path| !path.is_empty()) {
+            let path = Path::new(path);
+            if path.starts_with(ignored) || ignored.starts_with(path) {
+                bail!("ignored live path collides with candidate source");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stage_candidate(
@@ -625,10 +659,11 @@ fn stage_candidate(
     for args in [
         vec!["init", "--template="],
         vec!["fetch", "--no-tags", "--no-recurse-submodules", "--", &url, commit],
-        vec!["checkout", "--detach", commit, "--"],
     ] {
         candidate_git(runner, scratch.path(), &source, &args)?;
     }
+    check_ignored_candidate_collisions(runner, scratch.path(), &live, &source, commit)?;
+    candidate_git(runner, scratch.path(), &source, &["checkout", "--detach", commit, "--"])?;
     if candidate_git(runner, scratch.path(), &source, &["rev-parse", "HEAD"])? != commit {
         bail!("candidate commit mismatch");
     }
@@ -790,6 +825,97 @@ mod tests {
                 assert_eq!(runner.count(forbidden), 0, "unexpected {forbidden}");
             }
         }
+    }
+
+    #[test]
+    fn candidate_staging_ignored_collision_guard_is_read_only() {
+        let mut accepted = Vec::new();
+        for case in ["exact", "ancestor", "descendant", "newline", "output-symlink", "benign"] {
+            let (live, remote, scratch, mut commit, runner) = staging_fixture();
+            std::fs::remove_file(live.path().join("notes")).unwrap();
+            std::fs::write(live.path().join(".git/info/exclude"), "/target/\n/Cargo.lock\n/local-cache/\n/assets\n/odd\n").unwrap();
+            match case {
+                "exact" => { std::fs::write(live.path().join("Cargo.lock"), "operator lockfile").unwrap(); }
+                "ancestor" => {
+                    std::fs::create_dir(remote.path().join("assets")).unwrap();
+                    std::fs::write(remote.path().join("assets/file"), "candidate").unwrap();
+                    std::fs::write(live.path().join("assets"), "ignored operator file").unwrap();
+                }
+                "descendant" => {
+                    std::fs::create_dir(live.path().join("Cargo.lock")).unwrap();
+                    std::fs::write(live.path().join("Cargo.lock/notes"), "operator notes").unwrap();
+                }
+                "newline" => {
+                    std::fs::create_dir(remote.path().join("odd")).unwrap();
+                    std::fs::create_dir(live.path().join("odd")).unwrap();
+                    std::fs::write(remote.path().join("odd/line\nbreak"), "candidate").unwrap();
+                    std::fs::write(live.path().join("odd/line\nbreak"), "operator file").unwrap();
+                }
+                "output-symlink" => {
+                    std::fs::rename(live.path().join("target"), live.path().join("local-cache")).unwrap();
+                    std::os::unix::fs::symlink("local-cache", live.path().join("target")).unwrap();
+                }
+                _ => {
+                    std::fs::create_dir(live.path().join("local-cache")).unwrap();
+                    std::fs::write(live.path().join("local-cache/notes"), "harmless ignored file").unwrap();
+                    std::fs::create_dir(remote.path().join("local-cache")).unwrap();
+                    std::fs::write(remote.path().join("local-cache/candidate"), "noncolliding candidate file").unwrap();
+                }
+            }
+            if matches!(case, "ancestor" | "newline" | "benign") {
+                local_git(remote.path(), &["add", "."]);
+                local_git(remote.path(), &["commit", "-m", "candidate collision"]);
+                commit = local_git(remote.path(), &["rev-parse", "HEAD"]);
+            }
+            let before = checkout_snapshot(live.path());
+            let result = stage_candidate(&runner, live.path(), "forgegod/eliasstravik-herdr-projects", &commit, scratch.path());
+            if case == "benign" {
+                assert!(result.is_ok(), "benign ignored file rejected");
+                result.as_ref().unwrap().check_live_before_promotion(&runner).unwrap();
+            } else if result.is_ok() {
+                accepted.push(case);
+            }
+            drop(result);
+            assert_eq!(before, checkout_snapshot(live.path()), "live mutation: {case}");
+            assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+            assert_eq!(runner.count("cargo"), 0);
+            if case == "output-symlink" {
+                assert_eq!(std::fs::read_link(live.path().join("target")).unwrap(), Path::new("local-cache"));
+            }
+        }
+        assert!(accepted.is_empty(), "staging accepted ignored collisions: {accepted:?}");
+    }
+
+    #[test]
+    fn candidate_staging_index_flag_guard_is_read_only() {
+        let mut accepted = Vec::new();
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            for state in ["clean", "modified", "missing"] {
+                let (live, _remote, scratch, commit, runner) = staging_fixture();
+                std::fs::remove_file(live.path().join("notes")).unwrap();
+                std::fs::write(live.path().join(".git/info/exclude"), "/target/\n").unwrap();
+                local_git(live.path(), &["update-index", flag, "--", "Cargo.toml"]);
+                match state {
+                    "modified" => { std::fs::write(live.path().join("Cargo.toml"), "hidden operator changes").unwrap(); }
+                    "missing" => { std::fs::remove_file(live.path().join("Cargo.toml")).unwrap(); }
+                    _ => {}
+                }
+                let before = checkout_snapshot(live.path());
+                let result = stage_candidate(&runner, live.path(), "forgegod/eliasstravik-herdr-projects", &commit, scratch.path());
+                if result.is_ok() {
+                    accepted.push((flag, state));
+                } else {
+                    assert_eq!(runner.count("fetch"), 0, "unsafe index reached candidate fetch");
+                    assert_eq!(runner.count("checkout"), 0);
+                    assert!(result.as_ref().err().unwrap().to_string().contains("index"));
+                }
+                drop(result);
+                assert_eq!(before, checkout_snapshot(live.path()), "index or live files changed: {flag} {state}");
+                assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+                assert_eq!(runner.count("cargo"), 0);
+            }
+        }
+        assert!(accepted.is_empty(), "staging accepted unsafe index flags: {accepted:?}");
     }
 
     #[test]
