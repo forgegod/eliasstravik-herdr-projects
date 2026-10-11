@@ -288,6 +288,15 @@ enum Command {
         /// Print the installed and the newest version and change nothing
         #[arg(long)]
         check: bool,
+        /// Opt in to read-only branch discovery (requires repository and ref)
+        #[arg(long, value_parser = ["branch"], requires_all = ["check", "repository", "reference"])]
+        channel: Option<String>,
+        /// Canonical GitHub owner/repo[/subdir], not a URL
+        #[arg(long, requires = "channel", value_parser = crate::update::repository_arg)]
+        repository: Option<String>,
+        /// Selected branch name or refs/heads/name
+        #[arg(long = "ref", requires = "channel", value_parser = crate::update::branch_ref_arg)]
+        reference: Option<String>,
     },
     /// The background ticker
     Ticker {
@@ -893,12 +902,99 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Command::Progress { pane } => crate::progress::print(&ctx, pane.as_deref()),
-        Command::Update { check } => crate::update::run(&ctx, check),
+        Command::Update { check, channel, repository, reference } => {
+            if channel.is_some() || repository.is_some() || reference.is_some() {
+                if !check || channel.as_deref() != Some("branch") || repository.is_none() || reference.is_none() {
+                    bail!("branch checks require --check --channel branch --repository <owner/repo> --ref <ref>");
+                }
+                print!("{}", crate::update::check_branch(&ctx, repository.as_deref().unwrap(), reference.as_deref().unwrap())?);
+                return Ok(());
+            }
+            crate::update::run(&ctx, check)
+        }
         Command::Ticker { command } => match command {
             TickerCommand::Start => ticker::start(&ctx),
             TickerCommand::Run => ticker::run(&ctx),
             TickerCommand::Stop => ticker::stop(&ctx.root),
             TickerCommand::Status => ticker::status(&ctx.root),
         },
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn update_ref_accepts_only_unambiguous_branch_names() {
+        for (reference, valid) in [
+            ("main", true), ("feature/topic", true), ("refs/heads/main", true),
+            ("", false), ("HEAD", false), ("refs/tags/v1", false),
+            ("refs/remotes/origin/main", false), ("-main", false),
+            ("main..next", false), ("main@{1}", false), ("main~1", false),
+            ("main^{}", false), ("main:other", false), ("main*", false),
+            ("main\\other", false), ("main?", false), ("a//b", false),
+            ("a/.b", false), ("a/b.lock", false), ("a/b.", false),
+            ("main\n", false), ("main ", false), ("/main", false),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "hp", "update", "--check", "--channel", "branch",
+                "--repository", "owner/repo", "--ref", reference,
+            ]);
+            assert_eq!(parsed.is_ok(), valid, "ref {reference:?}");
+        }
+    }
+
+    #[test]
+    fn update_repository_is_a_canonical_credential_free_identifier() {
+        for (repository, valid) in [
+            ("owner/repo", true), ("owner-2/repo.name/sub/dir", true),
+            ("", false), ("owner", false), ("/owner/repo", false),
+            ("owner/repo/", false), ("owner//repo", false), ("owner/repo.git", false),
+            ("https://github.com/owner/repo", false), ("git@github.com:owner/repo", false),
+            ("token@owner/repo", false), ("file:///owner/repo", false),
+            ("../repo", false), ("owner/..", false), ("owner/repo/../other", false),
+            ("owner/repo/./sub", false), ("owner/repo//sub", false),
+            ("-owner/repo", false), ("owner-/repo", false), ("ow_ner/repo", false),
+            ("owner/repo?token=x", false), ("owner/repo#main", false),
+            ("owner/repo/%2e%2e", false), ("owner/repo/white space", false),
+            ("owner/repo\\sub", false), ("owner/repo\n", false),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "hp", "update", "--check", "--channel", "branch",
+                "--repository", repository, "--ref", "main",
+            ]);
+            assert_eq!(parsed.is_ok(), valid, "repository {repository:?}");
+        }
+    }
+
+    #[test]
+    fn update_refuses_partial_or_malformed_flags() {
+        let flags = [
+            vec!["--channel", "branch"],
+            vec!["--check", "--repository", "owner/repo"],
+            vec!["--check", "--ref", "main"],
+            vec!["--channel", "branch", "--repository", "owner/repo", "--ref", "main"],
+            vec!["--check", "--channel", "release", "--repository", "owner/repo", "--ref", "main"],
+            vec!["--check", "--channel", "branch", "--repository", "owner/repo"],
+            vec!["--check", "--channel", "branch", "--ref", "main"],
+        ];
+        for flags in flags {
+            let mut args = vec!["hp", "update"];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(&args).is_err(), "accepted {args:?}");
+        }
+        for args in [vec!["hp", "update"], vec!["hp", "update", "--check"]] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+    }
+
+    #[test]
+    fn update_accepts_explicit_branch_check() {
+        let parsed = Cli::try_parse_from([
+            "hp", "update", "--check", "--channel", "branch",
+            "--repository", "forgegod/eliasstravik-herdr-projects", "--ref", "main",
+        ]);
+        assert!(parsed.is_ok(), "{}", parsed.err().unwrap());
     }
 }

@@ -30,6 +30,33 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Strict identifier syntax; do not repair a URL/path into an approved source.
+pub fn repository_arg(value: &str) -> std::result::Result<String, String> {
+    let parts: Vec<_> = value.split('/').collect();
+    let component = |s: &str| !s.is_empty() && s != "." && s != ".."
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    if parts.len() < 2 || !parts.iter().all(|s| component(s))
+        || parts[0].len() > 39 || parts[0].starts_with('-') || parts[0].ends_with('-')
+        || !parts[0].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || parts[1].len() > 100 || parts[1].ends_with(".git")
+    {
+        return Err("repository must be a canonical GitHub owner/repo[/subdir], not a URL or path".into());
+    }
+    Ok(value.to_string())
+}
+
+pub fn branch_ref_arg(value: &str) -> std::result::Result<String, String> {
+    let branch = value.strip_prefix("refs/heads/").unwrap_or(value);
+    if branch.is_empty() || branch == "HEAD" || branch.starts_with('-')
+        || branch.starts_with("refs/") || branch.contains("..")
+        || !branch.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._/".contains(&b))
+        || branch.split('/').any(|s| s.is_empty() || s.starts_with('.') || s.ends_with('.') || s.ends_with(".lock"))
+    {
+        return Err("ref must be an unambiguous branch name or refs/heads/name".into());
+    }
+    Ok(format!("refs/heads/{branch}"))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Install {
     /// Installed with `herdr plugin install OWNER/REPO`.
@@ -231,6 +258,105 @@ fn run_binary(ctx: &Ctx, binary: &Path, args: &[&str]) -> Result<bool> {
     Ok(out.success())
 }
 
+fn full_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn github_remote(value: &str) -> Result<String> {
+    let path = value.strip_prefix("https://github.com/")
+        .or_else(|| value.strip_prefix("git@github.com:"))
+        .or_else(|| value.strip_prefix("ssh://git@github.com/"))
+        .context("remote is not a credential-free GitHub URL")?;
+    let repo = path.strip_suffix(".git").unwrap_or(path);
+    repository_arg(repo).map_err(anyhow::Error::msg)?;
+    if repo.split('/').count() != 2 {
+        bail!("GitHub remote must identify exactly owner/repo");
+    }
+    Ok(repo.to_string())
+}
+
+fn branch_git(runner: &dyn Runner, root: &Path, args: &[&str]) -> Result<String> {
+    let out = runner.run(&git(root, GIT_TIMEOUT).args(args.iter().copied()))?;
+    if !out.success() {
+        bail!("could not read checkout provenance");
+    }
+    Ok(out.stdout.trim_end_matches('\n').to_string())
+}
+
+pub fn check_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<String> {
+    let repository = repository_arg(repository).map_err(anyhow::Error::msg)?;
+    let reference = branch_ref_arg(reference).map_err(anyhow::Error::msg)?;
+    let bin = ctx.env.herdr_bin();
+    let session = paths::resolve_session(&SessionFlags::default(), ctx.env, ctx.runner)?;
+    let herdr = Herdr::new(&bin, &session.socket, ctx.runner);
+    let out = ctx.runner.run(&herdr.cmd(herdr::CALL_TIMEOUT).args(["plugin", "list", "--plugin", PLUGIN_ID, "--json"]))?;
+    if !out.success() {
+        bail!("could not read installation provenance");
+    }
+    let install = parse_install(&out.stdout)?;
+    if let Install::Github { repo, .. } = &install {
+        if repo != &repository {
+            bail!("selected repository conflicts with managed provenance");
+        }
+        let json: serde_json::Value = serde_json::from_str(&out.stdout)?;
+        let source = &json["result"]["plugins"].as_array().context("missing plugins")?
+            .iter().find(|p| p["plugin_id"] == PLUGIN_ID).context("missing plugin")?["source"];
+        let requested = source["requested_ref"].as_str().context("missing managed requested_ref")?;
+        if branch_ref_arg(requested).map_err(anyhow::Error::msg)? != reference {
+            bail!("selected ref conflicts with managed provenance");
+        }
+        let head = branch_git(ctx.runner, install.root(), &["rev-parse", "--verify", "HEAD"])?;
+        let top = branch_git(ctx.runner, install.root(), &["rev-parse", "--show-toplevel"])?;
+        if source["resolved_commit"].as_str() != Some(&head) || source["managed_path"].as_str() != Some(&top) {
+            bail!("managed commit/path conflicts with checkout provenance");
+        }
+    }
+    let repo = repository.split('/').take(2).collect::<Vec<_>>().join("/");
+    let prefix = branch_git(ctx.runner, install.root(), &["rev-parse", "--show-prefix"])?;
+    let source = if prefix.is_empty() { repo.clone() } else { format!("{repo}/{}", prefix.strip_suffix('/').context("invalid checkout prefix")?) };
+    if source != repository {
+        bail!("selected subdirectory conflicts with checkout provenance");
+    }
+    let branch = ctx.runner.run(&git(install.root(), GIT_TIMEOUT).args(["symbolic-ref", "--quiet", "HEAD"]))?;
+    let remote = if branch.success() {
+        let branch = branch.stdout.trim_end_matches('\n');
+        let branch = branch.strip_prefix("refs/heads/").context("missing checkout branch provenance")?;
+        branch_ref_arg(branch).map_err(anyhow::Error::msg)?;
+        let merge = branch_git(ctx.runner, install.root(), &["config", "--local", "--no-includes", "--get-all", &format!("branch.{branch}.merge")])?;
+        if merge != reference {
+            bail!("selected ref conflicts with checkout tracking provenance");
+        }
+        let name = branch_git(ctx.runner, install.root(), &["config", "--local", "--no-includes", "--get-all", &format!("branch.{branch}.remote")])?;
+        if name.is_empty() || name == "." || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)) {
+            bail!("missing or ambiguous tracking remote");
+        }
+        branch_git(ctx.runner, install.root(), &["config", "--local", "--no-includes", "--get-all", &format!("remote.{name}.url")])?
+    } else if branch.code == Some(1) && !branch.timed_out && matches!(install, Install::Github { .. }) {
+        let urls = branch_git(ctx.runner, install.root(), &["config", "--local", "--no-includes", "--get-regexp", "^remote\\..*\\.url$"])?;
+        let lines: Vec<_> = urls.lines().collect();
+        if lines.len() != 1 { bail!("missing or ambiguous managed remote provenance"); }
+        lines[0].split_once(' ').context("invalid managed remote provenance")?.1.to_string()
+    } else {
+        bail!("missing branch provenance: detached linked checkout or unreadable HEAD");
+    };
+    if github_remote(&remote)? != repo {
+        bail!("selected repository conflicts with checkout provenance");
+    }
+    let url = format!("https://github.com/{repo}.git");
+    let out = ctx.runner.run(&git(install.root(), GIT_TIMEOUT).args(["ls-remote", "--heads", "--refs", &url, &reference]))
+        .map_err(|_| anyhow::anyhow!("could not query selected branch"))?;
+    if !out.success() {
+        bail!("could not query selected branch (offline, unavailable, or timed out); no fallback attempted");
+    }
+    let lines: Vec<_> = out.stdout.lines().collect();
+    if lines.len() != 1 { bail!("missing or ambiguous candidate branch"); }
+    let (candidate, found_ref) = lines[0].split_once('\t').context("invalid candidate response")?;
+    if !full_oid(candidate) || found_ref != reference {
+        bail!("invalid candidate commit or ref");
+    }
+    Ok(format!("repository: {repository}\nref: {reference}\ninstalled commit: unverified\ncandidate commit: {candidate}\n"))
+}
+
 pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
     let bin = ctx.env.herdr_bin();
     let session = paths::resolve_session(&SessionFlags::default(), ctx.env, ctx.runner)?;
@@ -298,6 +424,196 @@ pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::fake::{FakeRunner, fail, ok};
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+
+    fn branch_runner() -> FakeRunner {
+        branch_runner_with(|_| {})
+    }
+
+    fn branch_runner_with(setup: impl FnOnce(&FakeRunner)) -> FakeRunner {
+        let runner = FakeRunner::new();
+        setup(&runner);
+        runner.on("plugin list", ok(&list(r#"{"kind":"local"}"#)));
+        runner.on("rev-parse --show-prefix", ok(""));
+        runner.on("rev-parse --show-toplevel", ok("/p/root\n"));
+        runner.on("rev-parse --verify HEAD", ok(HEAD));
+        runner.on("symbolic-ref --quiet HEAD", ok("refs/heads/main\n"));
+        runner.on("config --local --no-includes --get-all branch.main.remote", ok("origin\n"));
+        runner.on("config --local --no-includes --get-all branch.main.merge", ok("refs/heads/main\n"));
+        runner.on("config --local --no-includes --get-all remote.origin.url", ok("https://github.com/forgegod/eliasstravik-herdr-projects.git\n"));
+        runner.on("ls-remote", ok(&format!("{HEAD}\trefs/heads/main\n")));
+        runner
+    }
+
+    fn branch_check(runner: &dyn Runner, repository: &str, reference: &str) -> Result<String> {
+        let home = tempfile::tempdir().unwrap();
+        let env = paths::Env::for_test(home.path(), &[("HERDR_SOCKET_PATH", "/synthetic/socket")]);
+        let ctx = Ctx { env: &env, root: home.path().join("projects"), config_dir: env.config_dir(), runner, detached_ticker: false };
+        let result = check_branch(&ctx, repository, reference);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "check wrote user state");
+        result
+    }
+
+    #[test]
+    fn branch_update_installed_commit_is_unverified_not_checkout_or_metadata() {
+        for source in [r#"{"kind":"local"}"#.to_string(), format!(r#"{{"kind":"github","owner":"forgegod","repo":"eliasstravik-herdr-projects","requested_ref":"main","resolved_commit":"{HEAD}","managed_path":"/p/root"}}"#)] {
+            let runner = branch_runner_with(|r| { r.on("plugin list", ok(&list(&source))); });
+            let report = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").unwrap();
+            assert!(report.contains("installed commit: unverified\n"), "{report}");
+            assert!(!report.contains(&format!("installed commit: {HEAD}")));
+        }
+    }
+
+    #[test]
+    fn branch_update_requires_one_exact_candidate_ref_and_full_oid() {
+        for response in [
+            "".to_string(), format!("{HEAD}\trefs/heads/other\n"),
+            "abc\trefs/heads/main\n".into(), format!("{}\trefs/heads/main\n", "z".repeat(40)),
+            format!("{HEAD}\trefs/heads/main\n{HEAD}\trefs/heads/main\n"),
+            format!("{HEAD}\trefs/heads/main extra\n"),
+        ] {
+            let runner = branch_runner_with(|r| { r.on("ls-remote", ok(&response)); });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err(), "accepted {response:?}");
+        }
+    }
+
+    #[test]
+    fn branch_update_offline_is_an_error_without_fallback() {
+        for output in [fail(128, "offline"), crate::runner::fake::timeout(), crate::runner::Output { code: Some(128), stdout: format!("{HEAD}\trefs/heads/main\n"), ..Default::default() }] {
+            let runner = branch_runner_with(|r| { r.on("ls-remote", output); });
+            let error = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").unwrap_err();
+            assert!(error.to_string().contains("could not query selected branch"), "{error}");
+            assert_eq!(runner.count("ls-remote"), 1);
+            assert_eq!(runner.count("--tags"), 0);
+        }
+    }
+
+    #[test]
+    fn branch_update_checks_detached_managed_install_without_switching() {
+        let source = format!(r#"{{"kind":"github","owner":"forgegod","repo":"eliasstravik-herdr-projects","requested_ref":"refs/heads/main","resolved_commit":"{HEAD}","managed_path":"/p/root"}}"#);
+        let runner = branch_runner_with(|r| {
+            r.on("plugin list", ok(&list(&source)));
+            r.on("symbolic-ref --quiet HEAD", fail(1, ""));
+            r.on("--get-regexp", ok("remote.renamed.url git@github.com:forgegod/eliasstravik-herdr-projects.git\n"));
+        });
+        let report = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").unwrap();
+        assert!(report.contains("candidate commit:"));
+        assert_eq!(runner.count("switch"), 0);
+        assert_eq!(runner.count("checkout"), 0);
+        let linked = branch_runner_with(|r| { r.on("symbolic-ref --quiet HEAD", fail(1, "")); });
+        assert!(branch_check(&linked, "forgegod/eliasstravik-herdr-projects", "main").is_err());
+        assert_eq!(linked.count("ls-remote"), 0);
+        for urls in ["", "remote.origin.url https://github.com/upstream/repo.git", "remote.a.url https://github.com/forgegod/eliasstravik-herdr-projects.git\nremote.b.url https://github.com/upstream/repo.git"] {
+            let runner = branch_runner_with(|r| {
+                r.on("plugin list", ok(&list(&source)));
+                r.on("symbolic-ref --quiet HEAD", fail(1, ""));
+                r.on("--get-regexp", ok(urls));
+            });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err());
+        }
+    }
+
+    #[test]
+    fn branch_update_refuses_managed_provenance_mismatch() {
+        let source = serde_json::json!({"kind":"github", "owner":"forgegod", "repo":"eliasstravik-herdr-projects", "requested_ref":"main", "resolved_commit":HEAD, "managed_path":"/p/root"});
+        let runner = branch_runner_with(|r| { r.on("plugin list", ok(&list(&source.to_string()))); });
+        assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_ok());
+        for (field, value) in [
+            ("owner", "upstream"), ("repo", "other"), ("subdir", "plugin"),
+            ("requested_ref", "other"), ("requested_ref", ""),
+            ("resolved_commit", "2222222222222222222222222222222222222222"),
+            ("resolved_commit", ""), ("managed_path", "/elsewhere"),
+        ] {
+            let mut bad = source.clone();
+            bad[field] = value.into();
+            let runner = branch_runner_with(|r| { r.on("plugin list", ok(&list(&bad.to_string()))); });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err(), "accepted {field}={value}");
+            assert_eq!(runner.count("ls-remote"), 0);
+        }
+        for field in ["requested_ref", "resolved_commit", "managed_path"] {
+            let mut bad = source.clone();
+            bad.as_object_mut().unwrap().remove(field);
+            let runner = branch_runner_with(|r| { r.on("plugin list", ok(&list(&bad.to_string()))); });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err(), "missing {field}");
+        }
+    }
+
+    #[test]
+    fn branch_update_follows_tracking_identity_not_remote_name() {
+        let runner = branch_runner_with(|r| {
+            r.on("branch.main.remote", ok("my-fork\n"));
+            r.on("remote.my-fork.url", ok("git@github.com:forgegod/eliasstravik-herdr-projects.git\n"));
+            r.on("remote.origin.url", ok("https://github.com/eliasstravik/herdr-projects.git\n"));
+        });
+        assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_ok());
+        assert_eq!(runner.count("remote.origin.url"), 0);
+        for remote in ["", ".", "origin\nother", "../origin"] {
+            let runner = branch_runner_with(|r| { r.on("branch.main.remote", ok(remote)); });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err());
+            assert_eq!(runner.count("ls-remote"), 0);
+        }
+        let runner = branch_runner_with(|r| { r.on("branch.main.remote", fail(1, "missing")); });
+        assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err());
+    }
+
+    #[test]
+    fn branch_update_requires_matching_subdirectory_and_tracking_ref() {
+        for (prefix, merge, selected, reference, valid) in [
+            ("plugin/sub/", "refs/heads/main", "forgegod/eliasstravik-herdr-projects/plugin/sub", "main", true),
+            ("", "refs/heads/main", "forgegod/eliasstravik-herdr-projects/plugin/sub", "main", false),
+            ("plugin/", "refs/heads/main", "forgegod/eliasstravik-herdr-projects", "main", false),
+            ("", "refs/heads/other", "forgegod/eliasstravik-herdr-projects", "main", false),
+            ("", "", "forgegod/eliasstravik-herdr-projects", "main", false),
+            ("", "refs/heads/main\nrefs/heads/other", "forgegod/eliasstravik-herdr-projects", "main", false),
+        ] {
+            let runner = branch_runner_with(|r| {
+                r.on("rev-parse --show-prefix", ok(prefix));
+                r.on("branch.main.merge", ok(merge));
+            });
+            assert_eq!(branch_check(&runner, selected, reference).is_ok(), valid, "{prefix:?} {merge:?}");
+            if !valid { assert_eq!(runner.count("ls-remote"), 0); }
+        }
+    }
+
+    #[test]
+    fn branch_update_reconciles_fork_upstream_url_identities() {
+        for url in [
+            "https://github.com/forgegod/eliasstravik-herdr-projects.git",
+            "git@github.com:forgegod/eliasstravik-herdr-projects.git",
+            "ssh://git@github.com/forgegod/eliasstravik-herdr-projects.git",
+        ] {
+            let runner = branch_runner_with(|r| { r.on("remote.origin.url", ok(url)); });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_ok());
+            assert!(branch_check(&runner, "eliasstravik/herdr-projects", "main").is_err(), "source switch allowed for {url}");
+        }
+        for url in [
+            "https://github.com/eliasstravik/herdr-projects.git",
+            "https://github.com.evil/forgegod/eliasstravik-herdr-projects.git",
+            "https://token@github.com/forgegod/eliasstravik-herdr-projects.git",
+            "file:///forgegod/eliasstravik-herdr-projects", "", "../repo",
+        ] {
+            let runner = branch_runner_with(|r| { r.on("remote.origin.url", ok(url)); });
+            assert!(branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").is_err(), "accepted {url}");
+            assert_eq!(runner.count("ls-remote"), 0);
+        }
+    }
+
+    #[test]
+    fn branch_update_checks_without_release_tags() {
+        let runner = branch_runner();
+        let report = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").unwrap();
+        assert!(report.contains("repository: forgegod/eliasstravik-herdr-projects\n"));
+        assert!(report.contains("ref: refs/heads/main\n"));
+        assert!(report.contains(&format!("candidate commit: {HEAD}\n")));
+        assert_eq!(runner.count("--tags"), 0);
+        assert_eq!(runner.count("--version"), 0);
+        assert!(runner.calls.borrow().iter().all(|c| c.timeout <= GIT_TIMEOUT));
+        for forbidden in ["fetch", "pull", "checkout", "switch", "install", "doctor", "ticker", "remote set"] {
+            assert_eq!(runner.count(forbidden), 0, "mutating call {forbidden}");
+        }
+    }
 
     fn list(kind_source: &str) -> String {
         format!(

@@ -1,13 +1,13 @@
 # CHG-002 — Fork-aware updates without losing local provenance
 
-**Status:** planned
+**Status:** in-progress
 **External request:** Direct operator request: because we forked the original project, check if the concept of https://github.com/afloury/herdr-projects/commit/08da209462e736f29b6e9d2325e0cd2b79613f0e could also be applied to this fork and create an appropriate CHR for it -- if applicable
 **Impacts:** CAP-004
 **Baseline:** `4e4548c` — release `0.2.34`; origin `forgegod/eliasstravik-herdr-projects`
 
 | # | Phase | Status | Verification gate |
 | --- | --- | --- | --- |
-| 1 | Explicit fork source and branch-channel discovery | pending | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
+| 1 | Explicit fork source and branch-channel discovery | in-progress | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
 | 2 | Stage and verify candidates without changing the live checkout | pending | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
 | 3 | Serialized promotion and explicit ticker recovery | pending | `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; transactional failure matrix passes |
 | 4 | Fork documentation, current CAP and release integration | pending | `sh scripts/check.sh && git diff --check` exits 0; disposable install/update smoke and provenance review pass |
@@ -54,11 +54,115 @@ same-version fork commits from release-version updates.
 3. Implement bounded source/ref resolution and a check-only report naming
    repository, ref, installed commit and candidate commit. Never infer fork
    ownership from a convenient remote name or silently fall back to upstream.
-4. Preserve current release-channel semantics. Require explicit selection where
-   origin, linked checkout and Herdr source metadata disagree. Record only
-   implemented behaviour in CAP-004; design approval alone is not a CAP change.
+4. Preserve current release-channel semantics. Branch checks require the selected
+   canonical repository/ref to agree with installation provenance; refuse missing,
+   ambiguous or conflicting provenance rather than using an explicit flag to
+   override it. Record only implemented behaviour in CAP-004; design approval
+   alone is not a CAP change.
 
 **Verification gate:** `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases above pass with named tests.
+
+### Phase 1 contract selection and implementation status
+
+**Execution:** Phase 1 started from clean `main` at `d71286b`. It remains
+in-progress; phases 2–4 remain pending. No phase-completion claim is made.
+
+Additional direct operator instruction: “If the decision cannot be derived from
+an explicit current repository contract, mark CHG-002 phase 1 blocked with
+source-backed alternatives/evidence before production changes; do not claim
+completion. Report the precise decision required.”
+
+The current contracts did not select a CLI/API spelling, persistence policy or
+managed-install boundary. The review package recommended a Rust branch channel,
+not a particular approved interface. Source investigation found:
+
+- `src/cli.rs:286–291,896` defines only `update [--check]` and dispatches to
+  `update::run(ctx, check_only)`. `docs/getting-started.md:118–124` and
+  `docs/operations.md:73` promise release behaviour. CLI long-option conventions
+  support adding explicit flags; nested commands such as `Ticker` also exist,
+  but do not authorize converting bare `update` into a required subcommand.
+- `src/update.rs:50–91,127–145,234–265` parses local/GitHub installation kinds,
+  lists release tags on `origin`, and compares versions. Managed source and
+  origin are not reconciled. `newer_release` is the separate quiet doctor probe
+  (`src/doctor.rs:88–90`); `own_root` also locates setup's bundled skill
+  (`src/setup.rs:264–265`). Preserve these callers' existing contracts.
+- `src/update.rs:193–208` reinstalls managed sources with Herdr's `--ref`, but
+  pulls linked `origin main`. `docs/herdr-notes.md:156–166` records historical
+  disposable-server evidence that managed clones are detached and carry
+  `requested_ref`, `resolved_commit` and `managed_path`. The updater's parser
+  currently discards those fields, including in its synthetic managed fixture
+  (`src/update.rs:315–318`). Historical notes are not a new live Herdr check.
+- `build.rs:7–20` embeds a short SHA/timestamp or `nogit`; `src/main.rs:46`
+  exposes it in the version string. `src/update.rs:151–155` reads only the
+  version. Neither checkout HEAD nor managed metadata alone proves which
+  commit built an installed binary. Missing/conflicting provenance must not be
+  reported as a verified installed commit.
+- `scripts/install.sh:53–79,112–120` checks the release commit before downloading,
+  validates the executable version, and retains an upstream URL fallback for
+  an unrecognized origin. `herdr-plugin.toml:8–10` invokes that installer. These
+  are existing release contracts, not authorization to reuse that fallback for
+  branch checks or invoke installation in phase 1.
+- `src/paths.rs:48–50,85–109` owns user config/root resolution;
+  `src/profiles.rs:118–145` owns launch defaults, not update-source settings.
+  No update-channel persistence contract exists. `tests/cli.rs` has no updater
+  integration coverage; `src/update.rs:308–364` covers installation parsing,
+  version/tag comparison and the quiet offline doctor probe, not the phase matrix.
+
+**Operator-selected contract:**
+
+1. **CLI/API:** add branch checking only as
+   `herdr-projects update --check --channel branch --repository <owner>/<repo>[/<subdir>] --ref <ref>`.
+   `--repository` is a canonical, credential-free GitHub identity—not a URL—and
+   accepts neither userinfo nor arbitrary transports/paths. Branch-mode flags
+   require `--check`; a partial branch invocation is refused. Bare `update` and
+   `update --check` retain their release-channel behaviour.
+2. **Persistence:** selections are per invocation only in phase 1. Do not write
+   configuration, remember a source/ref, or implicitly reuse prior selection.
+3. **Managed support:** support linked and Herdr-managed GitHub installations
+   read-only. Canonical source identity (including subdirectory) and requested
+   ref must agree with available provenance; refuse missing, ambiguous or
+   conflicting evidence. Where the installed binary's commit cannot be proved,
+   report it as `unverified`, never as a verified commit. Neither choice
+   authorizes promotion, source switching or installation.
+
+Implementation has started with focused RED→GREEN cycles for the selected
+contract. The phase remains incomplete: equal/ahead/diverged classification must
+not guess from remote SHAs alone when ancestry objects are missing, and any
+necessary object acquisition must be isolated from the live checkout. CAP-004,
+architecture and accepted design decisions remain unchanged until the complete
+behaviour and phase gate are verified.
+
+### Phase 1 baseline verification before implementation
+
+- Before the contract selection, no RED/GREEN cycle was started because choosing
+  behaviour tests for an unapproved CLI/persistence/managed-support contract
+  would have pre-empted the required decision.
+- `cargo test --locked update && sh scripts/check-records.sh` exited 0 in a
+  disposable container using the existing `herdr-projects-blueprint-verify`
+  image `sha256:32083d2ba467a8af4f60e97857f7e50f7dc74c7633a670b4963bb425f8d18237`.
+  Its filesystem layers were verified to extend `rust:1.89-bookworm`; runtime
+  checks reported Rust/Cargo 1.89.0, Node 22.23.3 and installed rsync. The repo
+  was read-only at `/repo`; Cargo ran as UID/GID 1000 with a clean environment,
+  writable scratch HOME/CARGO_HOME/target/TMPDIR and only `/repo` trusted by Git.
+  No host home, credential directory or active installation was mounted.
+- Cargo ran 8 passing unit tests (317 filtered out): the six updater tests
+  `update::tests::a_linked_checkout_is_detected`,
+  `update::tests::a_github_install_is_detected_with_its_repository`,
+  `update::tests::a_missing_plugin_or_unknown_source_is_an_error`,
+  `update::tests::release_tags_compare_as_numbers`,
+  `update::tests::the_newest_release_is_picked_from_ls_remote`,
+  `update::tests::doctor_check_is_silent_outside_a_checkout_and_offline`, plus
+  filter matches `project::tests::coordinator_updates_keep_other_fields` and
+  `thread::tests::updates_are_atomic_and_keep_other_fields`. The CLI target ran
+  zero tests (4 filtered out); it is not updater integration evidence.
+- The record suite passed all 73 tests and validated 4 CAPs / 3 CHGs.
+  `git diff --check` exited 0. These passes establish baseline/documentation
+  health, not phase-1 acceptance or a new branch-channel implementation.
+- The pre-implementation DOX pass changed only this CHG and
+  `docs/changes/README.md`. Root, `docs/AGENTS.md` and
+  `docs/changes/AGENTS.md` remain applicable and unchanged: no ownership,
+  durable workflow or child index changed. The final phase DOX pass and evidence
+  update remain required before completion.
 
 ## Phase 2 — Stage and verify candidates without changing the live checkout
 
