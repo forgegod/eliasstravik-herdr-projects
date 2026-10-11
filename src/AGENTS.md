@@ -15,6 +15,8 @@ All Rust modules and their colocated unit/scenario tests. `main.rs` enters `cli.
 - Treat an unknown input box or trust screen conservatively. Do not broaden a parser without negative fixtures.
 - Keep hook errors fail-open and side effects scoped; launch/authorization failures must not silently select a different agent identity.
 - Branch-history checks acquire local Git objects only in a disposable bare repository. Never fetch into or change the live installation; report incomplete ancestry as unavailable. Checkout history is not installed-binary provenance: an unverified installed commit cannot support an installed-ahead/equal/diverged claim.
+- Candidate staging in `update.rs` is exposed only through `update --stage --channel branch --repository … --ref …`; it is not a replacement for release updates or phase-1 checks. Fetch only the selected full commit into disposable scratch; native builds use isolated Cargo home/target directories, locked dependencies and bounded Runner commands. Never invoke an installer or automatic container fallback.
+- The candidate live-state guard is read-only and must be repeated under phase-3 installation ownership before any future promotion. It currently rejects tracked dirt, nonignored untracked files and observed HEAD/branch/remote/binary changes; ignored collisions, index flags and post-verification artifact changes still need coverage/hardening. A passing guard is not a promotion transaction or a sandbox guarantee.
 
 ## Work Guidance
 

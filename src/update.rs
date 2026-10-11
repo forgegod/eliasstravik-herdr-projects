@@ -331,6 +331,38 @@ fn checkout_history(runner: &dyn Runner, root: &Path, candidate: &str) -> Result
 }
 
 pub fn check_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<String> {
+    let BranchCandidate { install, repository, reference, commit: candidate } = select_branch(ctx, repository, reference, None)?;
+    let history = checkout_history(ctx.runner, install.root(), &candidate).unwrap_or_else(|_| {
+        "checkout history: unavailable (local ancestry missing or unreadable; no network acquisition attempted)\n".into()
+    });
+    Ok(format!("repository: {repository}\nref: {reference}\ninstalled commit: unverified\ncandidate commit: {candidate}\n{history}installed history: unavailable (installed commit unverified)\n"))
+}
+
+struct BranchCandidate {
+    install: Install,
+    repository: String,
+    reference: String,
+    commit: String,
+}
+
+/// Stage-only: no candidate path or executable survives this boundary.
+pub fn stage_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<String> {
+    let scratch = tempfile::tempdir()?;
+    let verification = (|| -> Result<()> {
+        let selected = select_branch(ctx, repository, reference, Some(scratch.path()))?;
+        let staged = stage_candidate(ctx.runner, selected.install.root(), &selected.repository, &selected.commit, scratch.path())?;
+        staged.build_native(ctx.runner, &selected.repository, &selected.commit)?;
+        staged.check_live_before_promotion(ctx.runner)?;
+        Ok(())
+    })();
+    // Explicit close propagates cleanup failures rather than reporting success
+    // based on TempDir's best-effort Drop. This also covers failed verification.
+    scratch.close().map_err(|_| anyhow::anyhow!("candidate cleanup failed; no installation attempted"))?;
+    verification.map_err(|_| anyhow::anyhow!("candidate verification failed; candidate cleaned up; no installation attempted"))?;
+    Ok("candidate verification: passed\ncandidate cleanup: complete\ninstallation: unchanged (stage only)\n".into())
+}
+
+fn select_branch(ctx: &Ctx, repository: &str, reference: &str, scratch: Option<&Path>) -> Result<BranchCandidate> {
     let repository = repository_arg(repository).map_err(anyhow::Error::msg)?;
     let reference = branch_ref_arg(reference).map_err(anyhow::Error::msg)?;
     let bin = ctx.env.herdr_bin();
@@ -390,7 +422,13 @@ pub fn check_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<Stri
         bail!("selected repository conflicts with checkout provenance");
     }
     let url = format!("https://github.com/{repo}.git");
-    let out = ctx.runner.run(&git(install.root(), GIT_TIMEOUT).args(["ls-remote", "--heads", "--refs", &url, &reference]))
+    let query = if let Some(home) = scratch {
+        candidate_command(git(home, GIT_TIMEOUT), home)
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "credential.helper="])
+    } else {
+        git(install.root(), GIT_TIMEOUT)
+    };
+    let out = ctx.runner.run(&query.args(["ls-remote", "--heads", "--refs", &url, &reference]))
         .map_err(|_| anyhow::anyhow!("could not query selected branch"))?;
     if !out.success() {
         bail!("could not query selected branch (offline, unavailable, or timed out); no fallback attempted");
@@ -401,10 +439,7 @@ pub fn check_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<Stri
     if !full_oid(candidate) || found_ref != reference {
         bail!("invalid candidate commit or ref");
     }
-    let history = checkout_history(ctx.runner, install.root(), candidate).unwrap_or_else(|_| {
-        "checkout history: unavailable (local ancestry missing or unreadable; no network acquisition attempted)\n".into()
-    });
-    Ok(format!("repository: {repository}\nref: {reference}\ninstalled commit: unverified\ncandidate commit: {candidate}\n{history}installed history: unavailable (installed commit unverified)\n"))
+    Ok(BranchCandidate { install, repository, reference, commit: candidate.into() })
 }
 
 pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
@@ -471,12 +506,391 @@ pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
     }
 }
 
+// Internal candidate lifetime; the stage-only CLI never exposes a promotion target.
+struct StagedCandidate {
+    scratch: tempfile::TempDir,
+    source: PathBuf,
+    repository: String,
+    commit: String,
+    live: PathBuf,
+    live_state: LiveCandidateState,
+}
+
+impl StagedCandidate {
+    /// Read-only guard, not a lock or authorization to promote. Phase 3 must
+    /// repeat this under installation ownership immediately before promotion.
+    fn check_live_before_promotion(&self, runner: &dyn Runner) -> Result<()> {
+        let current = live_candidate_state(runner, self.scratch.path(), &self.live)?;
+        if !self.live_state.status.is_empty() || !current.status.is_empty() {
+            bail!("live checkout is dirty or has untracked collisions");
+        }
+        if current != self.live_state { bail!("live installation changed concurrently"); }
+        Ok(())
+    }
+
+    fn build_native(&self, runner: &dyn Runner, repository: &str, commit: &str) -> Result<PathBuf> {
+        if repository != self.repository || commit != self.commit {
+            bail!("candidate source/commit provenance mismatch");
+        }
+        if candidate_git(runner, self.scratch.path(), &self.source, &["rev-parse", "HEAD"])? != commit {
+            bail!("candidate commit mismatch");
+        }
+        let subdir = repository.split('/').skip(2).collect::<Vec<_>>().join("/");
+        let package = std::fs::canonicalize(self.source.join(subdir))?;
+        if !package.starts_with(&self.source) { bail!("candidate package escapes source"); }
+        let manifest: toml::Value = toml::from_str(&std::fs::read_to_string(package.join("Cargo.toml"))?)?;
+        if manifest["package"]["name"].as_str() != Some(PLUGIN_ID) {
+            bail!("candidate package identity mismatch");
+        }
+        let version = manifest["package"]["version"].as_str().context("candidate version missing")?;
+        if parse_release(&format!("v{version}")).is_none() { bail!("invalid candidate version"); }
+        if !package.join("Cargo.lock").is_file() { bail!("candidate lockfile missing"); }
+        let target = self.scratch.path().join("target");
+        let cmd = candidate_command(Cmd::new("cargo", BUILD_TIMEOUT), self.scratch.path())
+            .cwd(&package)
+            .env("CARGO_HOME", self.scratch.path().join("cargo-home").to_string_lossy())
+            .env("CARGO_TARGET_DIR", target.to_string_lossy())
+            .env_remove("CARGO_BUILD_TARGET").env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS").env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER").env_remove("CARGO_REGISTRY_TOKEN")
+            .args(["build", "--release", "--locked", "--bin", PLUGIN_ID, "--target-dir"])
+            .arg(target.to_string_lossy());
+        if !runner.run(&cmd)?.success() { bail!("native candidate build failed; no fallback attempted"); }
+        let binary = target.join("release/herdr-projects");
+        let checksum = candidate_checksum(&binary)?;
+        let out = runner.run(&candidate_command(Cmd::new(binary.to_string_lossy(), STEP_TIMEOUT), self.scratch.path())
+            .cwd(self.scratch.path()).arg("--version"))?;
+        if !out.success() { bail!("candidate executable cannot run"); }
+        let reported = out.stdout.trim().strip_prefix("herdr-projects ").context("candidate executable identity mismatch")?;
+        let (found_version, build) = reported.split_once('+').context("candidate build provenance missing")?;
+        let (hash, timestamp) = build.split_once('.').context("candidate build provenance missing")?;
+        if found_version != version || hash.len() < 7 || !commit.starts_with(hash)
+            || timestamp.is_empty() || !timestamp.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("candidate version/commit provenance mismatch");
+        }
+        if candidate_checksum(&binary)? != checksum { bail!("candidate checksum mismatch"); }
+        if !candidate_git(runner, self.scratch.path(), &self.source, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+            bail!("candidate source changed during build");
+        }
+        Ok(binary)
+    }
+}
+
+fn candidate_checksum(path: &Path) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    if !std::fs::symlink_metadata(path)?.is_file() { bail!("candidate must be a regular file"); }
+    Ok(Sha256::digest(std::fs::read(path)?).to_vec())
+}
+
+#[derive(PartialEq)]
+struct LiveCandidateState {
+    head: String,
+    branch: String,
+    status: String,
+    remotes: String,
+    binary: Vec<u8>,
+}
+
+fn live_candidate_state(runner: &dyn Runner, home: &Path, live: &Path) -> Result<LiveCandidateState> {
+    let read = |args: &[&str]| candidate_git(runner, home, live, args);
+    Ok(LiveCandidateState {
+        head: read(&["rev-parse", "--verify", "HEAD"] )?,
+        branch: read(&["rev-parse", "--abbrev-ref", "HEAD"] )?,
+        status: read(&["status", "--porcelain", "--untracked-files=all"] )?,
+        remotes: read(&["config", "--local", "--no-includes", "--get-regexp", "^remote\\..*\\.url$"] )?,
+        binary: candidate_checksum(&binary_in(live))?,
+    })
+}
+
+fn stage_candidate(
+    runner: &dyn Runner, live: &Path, repository: &str, commit: &str, scratch: &Path,
+) -> Result<StagedCandidate> {
+    repository_arg(repository).map_err(anyhow::Error::msg)?;
+    if !full_oid(commit) { bail!("candidate requires an explicitly selected full commit"); }
+    let live = std::fs::canonicalize(live)?;
+    let parent = std::fs::canonicalize(scratch)?;
+    if parent.starts_with(&live) { bail!("candidate scratch must be outside live checkout"); }
+    let scratch = tempfile::tempdir_in(parent)?;
+    let live_state = live_candidate_state(runner, scratch.path(), &live)?;
+    // This internal slice accepts only unambiguous checkout source evidence.
+    // Managed/tracking selection remains the phase-1 caller's responsibility.
+    let urls: Vec<_> = live_state.remotes.lines().collect();
+    let repo = repository.split('/').take(2).collect::<Vec<_>>().join("/");
+    if urls.len() != 1 || github_remote(urls[0].split_once(' ').context("missing source provenance")?.1)? != repo {
+        bail!("candidate source conflicts with live provenance");
+    }
+    let source = scratch.path().join("source");
+    std::fs::create_dir(&source)?;
+    let url = format!("https://github.com/{repo}.git");
+    for args in [
+        vec!["init", "--template="],
+        vec!["fetch", "--no-tags", "--no-recurse-submodules", "--", &url, commit],
+        vec!["checkout", "--detach", commit, "--"],
+    ] {
+        candidate_git(runner, scratch.path(), &source, &args)?;
+    }
+    if candidate_git(runner, scratch.path(), &source, &["rev-parse", "HEAD"])? != commit {
+        bail!("candidate commit mismatch");
+    }
+    Ok(StagedCandidate { scratch, source, repository: repository.into(), commit: commit.into(), live, live_state })
+}
+
+fn candidate_command(cmd: Cmd, home: &Path) -> Cmd {
+    let mut cmd = cmd.own_group()
+        .env("HOME", home.to_string_lossy())
+        .env("XDG_CONFIG_HOME", home.to_string_lossy())
+        .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0").env("GIT_CONFIG_PARAMETERS", "")
+        .env("GIT_NO_REPLACE_OBJECTS", "1").env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "https").env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SHALLOW_FILE",
+        "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK"] {
+        cmd = cmd.env_remove(key);
+    }
+    cmd
+}
+
+fn candidate_git(runner: &dyn Runner, home: &Path, root: &Path, args: &[&str]) -> Result<String> {
+    let cmd = candidate_command(git(root, GIT_TIMEOUT), home)
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "credential.helper="])
+        .args(args.iter().copied());
+    let out = runner.run(&cmd)?;
+    if !out.success() { bail!("candidate Git step failed: {}", args[0]); }
+    Ok(out.stdout.trim_end_matches('\n').into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runner::fake::{FakeRunner, fail, ok};
 
     const HEAD: &str = "1111111111111111111111111111111111111111";
+
+    fn staging_fixture() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, String, FakeRunner) {
+        let (remote, _, _, _) = local_history();
+        std::fs::write(remote.path().join("Cargo.toml"), "[package]\nname = 'herdr-projects'\nversion = '0.2.34'\n").unwrap();
+        std::fs::write(remote.path().join("Cargo.lock"), "# synthetic locked dependencies\n").unwrap();
+        local_git(remote.path(), &["add", "Cargo.toml", "Cargo.lock"]);
+        local_git(remote.path(), &["commit", "-m", "candidate"]);
+        let commit = local_git(remote.path(), &["rev-parse", "HEAD"]);
+        let (live, _, _, _) = local_history();
+        local_git(live.path(), &["remote", "add", "origin", "https://github.com/forgegod/eliasstravik-herdr-projects.git"]);
+        std::fs::create_dir_all(live.path().join("target/release")).unwrap();
+        std::fs::write(binary_in(live.path()), "active executable, never replace").unwrap();
+        std::fs::write(live.path().join("notes"), "untracked operator notes").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let runner = FakeRunner::new();
+        let live_path = live.path().to_path_buf();
+        let remote_path = remote.path().to_path_buf();
+        runner.on_fn(|c| c.program == "git", move |cmd| {
+            assert!(cmd.own_group && cmd.timeout <= GIT_TIMEOUT);
+            if Path::new(&cmd.args[1]) == live_path {
+                for forbidden in ["fetch", "checkout", "reset", "stash", "remote", "pull"] {
+                    assert!(!cmd.args.iter().any(|a| a == forbidden), "live mutation: {}", cmd.display());
+                }
+            }
+            let mut local = cmd.clone();
+            if let Some(i) = local.args.iter().position(|a| a == "https://github.com/forgegod/eliasstravik-herdr-projects.git") {
+                assert!(local.args.iter().any(|a| a == "fetch"));
+                local.args[i] = remote_path.to_string_lossy().into_owned();
+                local = local.env("GIT_ALLOW_PROTOCOL", "file");
+            }
+            crate::runner::RealRunner.run(&local)
+        });
+        (live, remote, scratch, commit, runner)
+    }
+
+    #[test]
+    fn candidate_stage_interface_preserves_legacy_update_dispatch() {
+        for check in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let env = paths::Env::for_test(home.path(), &[("HERDR_SOCKET_PATH", "/synthetic/socket")]);
+            let runner = FakeRunner::new();
+            runner.on("plugin list", ok(&list(r#"{"kind":"local"}"#)));
+            runner.on("--version", ok("herdr-projects 0.2.34\n"));
+            runner.on("ls-remote --tags --refs origin", ok("abc\trefs/tags/v999.0.0\n"));
+            runner.on("rev-parse --abbrev-ref HEAD", ok("operator-branch\n"));
+            let ctx = Ctx { env: &env, root: home.path().join("projects"), config_dir: env.config_dir(), runner: &runner, detached_ticker: false };
+            let mut args = vec!["herdr-projects", "update"];
+            if check { args.push("--check"); }
+            let result = crate::cli::dispatch_test(&ctx, &args);
+            if check {
+                result.unwrap();
+                assert_eq!(runner.count("rev-parse"), 0);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("not `main`"));
+            }
+            assert_eq!(runner.count("ls-remote --tags --refs origin"), 1);
+            assert_eq!(runner.count("--version"), 1);
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+            for forbidden in ["fetch", "cargo", "plugin install", "scripts/install", "doctor", "ticker"] {
+                assert_eq!(runner.count(forbidden), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_stage_cli_dispatch_verifies_and_cleans_before_returning() {
+        for case in ["valid", "subdir", "build-failure", "dirty"] {
+            let (live, remote, _scratch, mut commit, staging) = staging_fixture();
+            std::fs::remove_file(live.path().join("notes")).unwrap();
+            std::fs::write(live.path().join(".git/info/exclude"), "/target/\n").unwrap();
+            let package = if case == "subdir" { "plugin" } else { "" };
+            if case == "subdir" {
+                std::fs::create_dir(remote.path().join(package)).unwrap();
+                for file in ["Cargo.toml", "Cargo.lock"] {
+                    local_git(remote.path(), &["mv", file, &format!("{package}/{file}")]);
+                }
+                local_git(remote.path(), &["commit", "-m", "nested package"]);
+                commit = local_git(remote.path(), &["rev-parse", "HEAD"]);
+            }
+            if case == "dirty" { std::fs::write(live.path().join("Cargo.toml"), "operator edit").unwrap(); }
+            let before = checkout_snapshot(live.path());
+            let runner = FakeRunner::new();
+            runner.on("plugin list", ok(&list(r#"{"kind":"local"}"#).replace("/p/root", live.path().to_str().unwrap())));
+            runner.on("rev-parse --show-prefix", ok(if package.is_empty() { "" } else { "plugin/\n" }));
+            runner.on("symbolic-ref --quiet HEAD", ok("refs/heads/main\n"));
+            runner.on("branch.main.merge", ok("refs/heads/main\n"));
+            runner.on("branch.main.remote", ok("origin\n"));
+            runner.on("remote.origin.url", ok("https://github.com/forgegod/eliasstravik-herdr-projects.git\n"));
+            let selected = commit.clone();
+            let live_root = live.path().to_path_buf();
+            runner.on_fn(|c| c.args.iter().any(|a| a == "ls-remote"), move |cmd| {
+                assert_ne!(Path::new(&cmd.args[1]), live_root, "stage selection must not use live Git credentials/config");
+                assert!(cmd.env.contains(&("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())));
+                assert!(cmd.args.iter().any(|a| a == "credential.helper="));
+                Ok(ok(&format!("{selected}\trefs/heads/main\n")))
+            });
+            runner.on_fn(|c| c.program == "git", move |cmd| staging.run(cmd));
+            let built = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let seen = built.clone();
+            runner.on_fn(|c| c.program == "cargo", move |cmd| {
+                let target = PathBuf::from(cmd.args.last().unwrap());
+                *seen.borrow_mut() = Some(target.parent().unwrap().to_path_buf());
+                assert_eq!(cmd.cwd.as_ref().unwrap().file_name().unwrap(), if package.is_empty() { "source" } else { package });
+                if case == "build-failure" { return Ok(fail(1, "synthetic build failure")); }
+                std::fs::create_dir_all(target.join("release"))?;
+                std::fs::write(target.join("release/herdr-projects"), "synthetic candidate")?;
+                Ok(ok(""))
+            });
+            runner.on_fn(|c| c.args == ["--version"], move |_| Ok(ok(&format!("herdr-projects 0.2.34+{}.123\n", &commit[..7]))));
+            let home = tempfile::tempdir().unwrap();
+            let env = paths::Env::for_test(home.path(), &[("HERDR_SOCKET_PATH", "/synthetic/socket")]);
+            let ctx = Ctx { env: &env, root: home.path().join("projects"), config_dir: env.config_dir(), runner: &runner, detached_ticker: false };
+            let repository = format!("forgegod/eliasstravik-herdr-projects{}", if package.is_empty() { "" } else { "/plugin" });
+            let result = crate::cli::dispatch_test(&ctx, &["herdr-projects", "update", "--stage", "--channel", "branch", "--repository", &repository, "--ref", "main"]);
+            assert_eq!(result.is_ok(), matches!(case, "valid" | "subdir"), "{case}: {result:?}");
+            let scratch = built.borrow().clone().expect("stage dispatch did not build the candidate");
+            assert!(!scratch.exists(), "candidate survived dispatch: {case}");
+            assert_eq!(before, checkout_snapshot(live.path()), "live mutation: {case}");
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+            for forbidden in ["plugin install", "scripts/install", "doctor", "ticker", "docker", "--tags"] {
+                assert_eq!(runner.count(forbidden), 0, "unexpected {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_staging_refuses_conflicting_source_before_fetching() {
+        let (live, _remote, scratch, commit, runner) = staging_fixture();
+        local_git(live.path(), &["remote", "set-url", "origin", "https://github.com/upstream/other.git"]);
+        let before = checkout_snapshot(live.path());
+        let result = stage_candidate(&runner, live.path(), "forgegod/eliasstravik-herdr-projects", &commit, scratch.path());
+        assert!(result.is_err(), "staged a source conflicting with live provenance");
+        assert_eq!(runner.count("fetch"), 0);
+        assert_eq!(before, checkout_snapshot(live.path()));
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn candidate_guard_rejects_dirty_colliding_or_concurrently_changed_live_state() {
+        for case in ["dirty", "collision", "concurrent-file", "concurrent-head", "concurrent-branch", "concurrent-remote", "concurrent-binary", "clean"] {
+            let (live, _remote, scratch, commit, runner) = staging_fixture();
+            std::fs::remove_file(live.path().join("notes")).unwrap();
+            std::fs::write(live.path().join(".git/info/exclude"), "/target/\n").unwrap();
+            if case == "dirty" { std::fs::write(live.path().join("Cargo.toml"), "operator changes").unwrap(); }
+            if case == "collision" { std::fs::write(live.path().join("Cargo.lock"), "operator lockfile").unwrap(); }
+            let staged = stage_candidate(&runner, live.path(), "forgegod/eliasstravik-herdr-projects", &commit, scratch.path()).unwrap();
+            match case {
+                "concurrent-file" => { std::fs::write(live.path().join("Cargo.toml"), "concurrent edit").unwrap(); }
+                "concurrent-head" => {
+                    let tree = local_git(live.path(), &["rev-parse", "HEAD^{tree}"]);
+                    let next = local_git(live.path(), &["commit-tree", &tree, "-p", "HEAD", "-m", "concurrent commit"]);
+                    local_git(live.path(), &["update-ref", "refs/heads/main", &next]);
+                }
+                "concurrent-branch" => { local_git(live.path(), &["branch", "other"]); local_git(live.path(), &["symbolic-ref", "HEAD", "refs/heads/other"]); }
+                "concurrent-remote" => { local_git(live.path(), &["remote", "set-url", "origin", "https://github.com/upstream/other.git"]); }
+                "concurrent-binary" => { std::fs::write(binary_in(live.path()), "replaced by another installer").unwrap(); }
+                _ => {}
+            }
+            let before = checkout_snapshot(live.path());
+            let result = staged.check_live_before_promotion(&runner);
+            assert_eq!(result.is_ok(), case == "clean", "guard accepted {case}: {result:?}");
+            assert_eq!(before, checkout_snapshot(live.path()), "guard mutated live state: {case}");
+        }
+    }
+
+    #[test]
+    fn candidate_native_build_verifies_artifact_before_accepting_it() {
+        for case in ["valid", "version", "provenance", "not-runnable", "checksum", "build-timeout", "source", "commit"] {
+            let (live, _remote, scratch, commit, runner) = staging_fixture();
+            let before = checkout_snapshot(live.path());
+            let staged = stage_candidate(&runner, live.path(), "forgegod/eliasstravik-herdr-projects", &commit, scratch.path()).unwrap();
+            let stage_root = staged.scratch.path().to_path_buf();
+            let live_root = live.path().to_path_buf();
+            runner.on_fn(|c| c.program == "cargo", move |cmd| {
+                assert_eq!(cmd.args, ["build", "--release", "--locked", "--bin", "herdr-projects", "--target-dir", stage_root.join("target").to_str().unwrap()]);
+                assert!(cmd.own_group && cmd.timeout == BUILD_TIMEOUT);
+                assert!(!cmd.cwd.as_ref().unwrap().starts_with(&live_root));
+                assert!(cmd.env.contains(&("CARGO_HOME".into(), stage_root.join("cargo-home").to_string_lossy().into_owned())));
+                if case == "build-timeout" { return Ok(crate::runner::fake::timeout()); }
+                let binary = stage_root.join("target/release/herdr-projects");
+                std::fs::create_dir_all(binary.parent().unwrap())?;
+                std::fs::write(binary, "synthetic candidate artifact")?;
+                Ok(ok(""))
+            });
+            let oid = commit.clone();
+            runner.on_fn(|c| c.args == ["--version"], move |cmd| {
+                assert!(cmd.own_group && cmd.timeout <= STEP_TIMEOUT);
+                if case == "not-runnable" { bail!("Exec format error"); }
+                if case == "checksum" { std::fs::write(&cmd.program, "tampered artifact")?; }
+                let version = if case == "version" { "9.9.9" } else { "0.2.34" };
+                let hash = if case == "provenance" { "0000000" } else { &oid[..7] };
+                Ok(ok(&format!("herdr-projects {version}+{hash}.123\n")))
+            });
+            let repository = if case == "source" { "upstream/other" } else { "forgegod/eliasstravik-herdr-projects" };
+            let selected = if case == "commit" { HEAD } else { &commit };
+            let result = staged.build_native(&runner, repository, selected);
+            if case == "valid" {
+                assert!(result.is_ok(), "valid native candidate rejected: {result:?}");
+                assert!(result.unwrap().is_file());
+            } else {
+                assert!(result.is_err(), "accepted {case}");
+            }
+            assert_eq!(before, checkout_snapshot(live.path()), "live mutation: {case}");
+            let path = staged.scratch.path().to_path_buf();
+            drop(staged);
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn candidate_staging_preserves_entire_live_checkout_and_active_binary() {
+        let (live, _remote, scratch, commit, runner) = staging_fixture();
+        let before = checkout_snapshot(live.path());
+        let staged = stage_candidate(&runner, live.path(), "forgegod/eliasstravik-herdr-projects", &commit, scratch.path());
+        assert_eq!(before, checkout_snapshot(live.path()), "HEAD, branch, tracked/untracked files, remotes or binary changed");
+        let staged = staged.expect("selected immutable candidate must stage without changing live state");
+        assert!(!staged.source.starts_with(live.path()));
+        assert_eq!(local_git(&staged.source, &["rev-parse", "HEAD"]), commit);
+        assert!(staged.source.join("Cargo.lock").is_file());
+        let path = staged.scratch.path().to_path_buf();
+        drop(staged);
+        assert!(!path.exists(), "scratch was not cleaned up");
+        assert_eq!(before, checkout_snapshot(live.path()));
+    }
 
     struct HistoryRunner {
         root: PathBuf,

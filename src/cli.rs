@@ -284,12 +284,16 @@ enum Command {
         pane: Option<String>,
     },
     /// Update the plugin to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker
+    #[command(group(clap::ArgGroup::new("update_mode").args(["check", "stage"])))]
     Update {
         /// Print the installed and the newest version and change nothing
         #[arg(long)]
         check: bool,
-        /// Opt in to read-only branch discovery (requires repository and ref)
-        #[arg(long, value_parser = ["branch"], requires_all = ["check", "repository", "reference"])]
+        /// Build and verify a disposable branch candidate without installing it
+        #[arg(long, conflicts_with = "check", requires = "channel")]
+        stage: bool,
+        /// Opt in to branch checking or staging (requires repository and ref)
+        #[arg(long, value_parser = ["branch"], requires_all = ["repository", "reference"], requires = "update_mode")]
         channel: Option<String>,
         /// Canonical GitHub owner/repo[/subdir], not a URL
         #[arg(long, requires = "channel", value_parser = crate::update::repository_arg)]
@@ -646,7 +650,11 @@ pub fn run() -> Result<()> {
         detached_ticker: true,
     };
 
-    match cli.command {
+    dispatch(&ctx, cli.command)
+}
+
+fn dispatch(ctx: &Ctx, command: Command) -> Result<()> {
+    match command {
         Command::New { name, goal, repos, thread_profile, coordinator_profile } => {
             let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
             let config = crate::profiles::load(&ctx.config_dir)?;
@@ -902,12 +910,19 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Command::Progress { pane } => crate::progress::print(&ctx, pane.as_deref()),
-        Command::Update { check, channel, repository, reference } => {
-            if channel.is_some() || repository.is_some() || reference.is_some() {
-                if !check || channel.as_deref() != Some("branch") || repository.is_none() || reference.is_none() {
-                    bail!("branch checks require --check --channel branch --repository <owner/repo> --ref <ref>");
+        Command::Update { check, stage, channel, repository, reference } => {
+            if stage || channel.is_some() || repository.is_some() || reference.is_some() {
+                if check == stage || channel.as_deref() != Some("branch") || repository.is_none() || reference.is_none() {
+                    bail!("branch updates require exactly one of --check or --stage, --channel branch --repository <owner/repo> --ref <ref>");
                 }
-                print!("{}", crate::update::check_branch(&ctx, repository.as_deref().unwrap(), reference.as_deref().unwrap())?);
+                let repository = repository.as_deref().unwrap();
+                let reference = reference.as_deref().unwrap();
+                let report = if stage {
+                    crate::update::stage_branch(&ctx, repository, reference)?
+                } else {
+                    crate::update::check_branch(&ctx, repository, reference)?
+                };
+                print!("{report}");
                 return Ok(());
             }
             crate::update::run(&ctx, check)
@@ -922,8 +937,41 @@ pub fn run() -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn dispatch_test(ctx: &Ctx, args: &[&str]) -> Result<()> {
+    dispatch(ctx, Cli::try_parse_from(args)?.command)
+}
+
+#[cfg(test)]
 mod update_tests {
     use super::*;
+
+    #[test]
+    fn update_stage_requires_exact_branch_identity_and_excludes_check() {
+        for mask in 0..8 {
+            for check in [false, true] {
+                let mut args = vec!["hp", "update", "--stage"];
+                if check { args.push("--check"); }
+                if mask & 1 != 0 { args.extend(["--channel", "branch"]); }
+                if mask & 2 != 0 { args.extend(["--repository", "owner/repo/subdir"]); }
+                if mask & 4 != 0 { args.extend(["--ref", "refs/heads/main"]); }
+                let parsed = Cli::try_parse_from(&args);
+                assert_eq!(parsed.is_ok(), mask == 7 && !check, "{args:?}: {}", parsed.err().map(|e| e.to_string()).unwrap_or_default());
+            }
+        }
+        for flags in [
+            vec!["--stage", "--channel", "release", "--repository", "owner/repo", "--ref", "main"],
+            vec!["--stage", "--channel", "branch", "--repository", "https://github.com/owner/repo", "--ref", "main"],
+            vec!["--stage", "--channel", "branch", "--repository", "owner/repo", "--ref", "HEAD"],
+        ] {
+            assert!(Cli::try_parse_from([vec!["hp", "update"], flags].concat()).is_err());
+        }
+        for check in [false, true] {
+            let mut args = vec!["hp", "update"];
+            if check { args.push("--check"); }
+            assert!(matches!(Cli::try_parse_from(args).unwrap().command,
+                Command::Update { check: actual, channel: None, repository: None, reference: None, .. } if actual == check));
+        }
+    }
 
     #[test]
     fn update_ref_accepts_only_unambiguous_branch_names() {

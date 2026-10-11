@@ -182,6 +182,20 @@ behaviour and phase gate are verified.
 **Goal:** Fetch/build/test failures leave the operator's branch, worktree and
 installed binary untouched.
 
+**Operator-selected boundary:** expose staging only as
+`herdr-projects update --stage --channel branch --repository <owner>/<repo>[/<subdir>] --ref <ref>`.
+It stages and verifies the selected immutable candidate in disposable scratch,
+reports the verification result, then cleans it up. It must not promote, replace
+the installed binary, change the live checkout, persist selection or act as an
+automatic fallback from either release update or `--check`.
+
+**Current progress:** the stage-only candidate foundation is implemented and
+verified without promotion. It rejects incomplete/mixed options, dirty live state,
+source mismatch, failed build, candidate version/provenance mismatch and a
+non-runnable candidate; it preserves the live checkout and removes scratch before
+returning. Phase 2 remains in-progress for its additional collision, timeout,
+real-build and post-verification-race hardening matrix.
+
 1. Add RED tests using temporary local Git repositories/remotes and synthetic
    installer processes; no network credentials or active installation.
 2. Stage the selected immutable commit in a separate directory/worktree. Keep
