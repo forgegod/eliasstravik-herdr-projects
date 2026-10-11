@@ -572,7 +572,7 @@ impl StagedCandidate {
             .env_remove("CARGO_BUILD_TARGET").env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS").env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER").env_remove("CARGO_REGISTRY_TOKEN")
-            .args(["build", "--release", "--locked", "--bin", PLUGIN_ID, "--target-dir"])
+            .args(["build", "--release", "--offline", "--locked", "--bin", PLUGIN_ID, "--target-dir"])
             .arg(target.to_string_lossy());
         let out = runner.run(&cmd)?;
         if out.timed_out { return Err(CandidateTimeout.into()); }
@@ -757,6 +757,119 @@ mod tests {
             crate::runner::RealRunner.run(&local)
         });
         (live, remote, scratch, commit, runner)
+    }
+
+    fn native_candidate_smoke(valid: bool) {
+        let (live, remote, _scratch, _, staging) = staging_fixture();
+        std::fs::remove_file(live.path().join("notes")).unwrap();
+        std::fs::write(live.path().join(".git/info/exclude"), "/target/\n").unwrap();
+        local_git(live.path(), &["config", "branch.main.remote", "origin"]);
+        local_git(live.path(), &["config", "branch.main.merge", "refs/heads/main"]);
+        // A dependency-free Rust package, not a prewritten executable or a
+        // scripted version response. Use the real product build provenance.
+        std::fs::write(remote.path().join("Cargo.toml"), "[package]\nname = 'herdr-projects'\nversion = '0.2.34'\nedition = '2024'\nrust-version = '1.89'\n").unwrap();
+        std::fs::write(remote.path().join("Cargo.lock"), "version = 4\n\n[[package]]\nname = 'herdr-projects'\nversion = '0.2.34'\n").unwrap();
+        std::fs::write(remote.path().join("build.rs"), include_str!("../build.rs")).unwrap();
+        std::fs::create_dir(remote.path().join("src")).unwrap();
+        let main = if valid {
+            r#"fn main() {
+                assert_eq!(std::env::args().skip(1).collect::<Vec<_>>(), ["--version"]);
+                println!("herdr-projects {}+{}", env!("CARGO_PKG_VERSION"), env!("HP_BUILD_ID"));
+            }"#
+        } else {
+            r#"fn main() {
+                assert_eq!(std::env::args().skip(1).collect::<Vec<_>>(), ["--version"]);
+                println!("invalid candidate identity");
+            }"#
+        };
+        std::fs::write(remote.path().join("src/main.rs"), main).unwrap();
+        local_git(remote.path(), &["add", "Cargo.toml", "Cargo.lock", "build.rs", "src/main.rs"]);
+        local_git(remote.path(), &["commit", "-m", "native candidate smoke"]);
+        let commit = local_git(remote.path(), &["rev-parse", "HEAD"]);
+        let before = checkout_snapshot(live.path());
+        assert!(before.contains_key(Path::new(".git/index")));
+        assert!(before.contains_key(Path::new(".git/config")));
+        assert!(before.contains_key(Path::new("target/release/herdr-projects")));
+        let runner = FakeRunner::new();
+        runner.on("plugin list", ok(&list(r#"{"kind":"local"}"#).replace("/p/root", live.path().to_str().unwrap())));
+        let remote_root = remote.path().to_path_buf();
+        runner.on_fn(|c| c.program == "git" && c.args.iter().any(|a| a == "ls-remote"), move |cmd| {
+            let mut local = cmd.clone();
+            let url = local.args.iter().position(|a| a == "https://github.com/forgegod/eliasstravik-herdr-projects.git").unwrap();
+            local.args[url] = remote_root.to_string_lossy().into_owned();
+            crate::runner::RealRunner.run(&local.env("GIT_ALLOW_PROTOCOL", "file"))
+        });
+        let scratch = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let seen = scratch.clone();
+        let selected = commit.clone();
+        let selection_home = _scratch.path().to_path_buf();
+        runner.on_fn(|c| c.program == "git" && !c.own_group, move |cmd| {
+            crate::runner::RealRunner.run(&candidate_command(cmd.clone(), &selection_home))
+        });
+        let native_scratch = scratch.clone();
+        runner.on_fn(|c| c.program == "cargo" || c.args == ["--version"], move |cmd| {
+            let root = native_scratch.borrow().clone().expect("native command before fetch");
+            assert!(cmd.own_group);
+            if cmd.program == "cargo" {
+                assert!(cmd.args.iter().any(|a| a == "--offline"), "native smoke requires offline Cargo, not network resolution");
+                assert_eq!(cmd.args, ["build", "--release", "--offline", "--locked", "--bin", "herdr-projects", "--target-dir", root.join("target").to_str().unwrap()]);
+                assert_eq!(cmd.timeout, BUILD_TIMEOUT);
+                assert_eq!(cmd.cwd.as_ref().unwrap(), &root.join("source"));
+                for (key, directory) in [("CARGO_HOME", "cargo-home"), ("CARGO_TARGET_DIR", "target")] {
+                    assert!(cmd.env.contains(&(key.into(), root.join(directory).to_string_lossy().into_owned())));
+                    assert!(!root.join(directory).exists(), "native build must start with isolated empty directories");
+                }
+            } else {
+                assert_eq!(Path::new(&cmd.program), root.join("target/release/herdr-projects"));
+                assert_eq!(cmd.cwd.as_ref().unwrap(), &root);
+                assert_eq!(cmd.timeout, STEP_TIMEOUT);
+            }
+            let out = crate::runner::RealRunner.run(cmd)?;
+            eprintln!("native smoke: {}\n{}{}", cmd.display(), out.stdout, out.stderr);
+            assert!(out.success(), "real native command failed: {}", out.error_text());
+            if cmd.program != "cargo" && !valid {
+                assert_eq!(out.stdout.trim(), "invalid candidate identity");
+            }
+            Ok(out)
+        });
+        runner.on_fn(|_| true, move |cmd| {
+            if cmd.program == "git" && cmd.args.iter().any(|a| a == "fetch") {
+                assert_eq!(cmd.args.last().unwrap(), &selected, "fetch must pin the immutable commit");
+                *seen.borrow_mut() = Some(PathBuf::from(&cmd.args[1]).parent().unwrap().to_path_buf());
+            }
+            let out = staging.run(cmd);
+            if let Err(error) = &out { eprintln!("native smoke runner: {error:#}"); }
+            out
+        });
+        let home = tempfile::tempdir().unwrap();
+        let env = paths::Env::for_test(home.path(), &[("HERDR_SOCKET_PATH", "/synthetic/socket")]);
+        let ctx = Ctx { env: &env, root: home.path().join("projects"), config_dir: env.config_dir(), runner: &runner, detached_ticker: false };
+        let result = stage_branch(&ctx, "forgegod/eliasstravik-herdr-projects", "main");
+        assert_eq!(before, checkout_snapshot(live.path()), "live checkout/index/remotes/binary changed");
+        let scratch = scratch.borrow().clone().expect("candidate fetch not reached");
+        assert!(!scratch.exists() && !scratch.parent().unwrap().exists(), "candidate scratch survived");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0, "user configuration written");
+        assert_eq!(runner.count("fetch"), 1);
+        assert_eq!(runner.count("cargo"), 1);
+        for forbidden in ["plugin install", "scripts/install", "doctor", "ticker", "docker", "--tags"] {
+            assert_eq!(runner.count(forbidden), 0, "unexpected {forbidden}");
+        }
+        if valid {
+            assert_eq!(result.unwrap(), "candidate verification: passed\ncandidate cleanup: complete\ninstallation: unchanged (stage only)\n");
+        } else {
+            assert_eq!(result.unwrap_err().to_string(), "candidate verification failed; candidate cleaned up; no installation attempted");
+        }
+        assert_eq!(runner.count("--version"), 1, "must execute the built candidate, not fail before its probe");
+    }
+
+    #[test]
+    fn candidate_native_smoke_builds_and_cleans_without_live_mutation() {
+        native_candidate_smoke(true);
+    }
+
+    #[test]
+    fn candidate_native_smoke_invalid_executable_cleans_without_success() {
+        native_candidate_smoke(false);
     }
 
     #[test]
@@ -1168,7 +1281,7 @@ mod tests {
             let stage_root = staged.scratch.path().to_path_buf();
             let live_root = live.path().to_path_buf();
             runner.on_fn(|c| c.program == "cargo", move |cmd| {
-                assert_eq!(cmd.args, ["build", "--release", "--locked", "--bin", "herdr-projects", "--target-dir", stage_root.join("target").to_str().unwrap()]);
+                assert_eq!(cmd.args, ["build", "--release", "--offline", "--locked", "--bin", "herdr-projects", "--target-dir", stage_root.join("target").to_str().unwrap()]);
                 assert!(cmd.own_group && cmd.timeout == BUILD_TIMEOUT);
                 assert!(!cmd.cwd.as_ref().unwrap().starts_with(&live_root));
                 assert!(cmd.env.contains(&("CARGO_HOME".into(), stage_root.join("cargo-home").to_string_lossy().into_owned())));
