@@ -345,6 +345,19 @@ struct BranchCandidate {
     commit: String,
 }
 
+// Carry only timeout classification across the sanitized stage boundary,
+// never subprocess output or arbitrary error text.
+#[derive(Debug)]
+struct CandidateTimeout;
+
+impl std::fmt::Display for CandidateTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("candidate operation timed out")
+    }
+}
+
+impl std::error::Error for CandidateTimeout {}
+
 /// Stage-only: no candidate path or executable survives this boundary.
 pub fn stage_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<String> {
     let scratch = tempfile::tempdir()?;
@@ -360,7 +373,10 @@ pub fn stage_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<Stri
     // Explicit close propagates cleanup failures rather than reporting success
     // based on TempDir's best-effort Drop. This also covers failed verification.
     scratch.close().map_err(|_| anyhow::anyhow!("candidate cleanup failed; no installation attempted"))?;
-    verification.map_err(|_| anyhow::anyhow!("candidate verification failed; candidate cleaned up; no installation attempted"))?;
+    verification.map_err(|error| {
+        let reason = if error.is::<CandidateTimeout>() { ": timed out" } else { "" };
+        anyhow::anyhow!("candidate verification failed{reason}; candidate cleaned up; no installation attempted")
+    })?;
     Ok("candidate verification: passed\ncandidate cleanup: complete\ninstallation: unchanged (stage only)\n".into())
 }
 
@@ -558,11 +574,14 @@ impl StagedCandidate {
             .env_remove("RUSTC_WORKSPACE_WRAPPER").env_remove("CARGO_REGISTRY_TOKEN")
             .args(["build", "--release", "--locked", "--bin", PLUGIN_ID, "--target-dir"])
             .arg(target.to_string_lossy());
-        if !runner.run(&cmd)?.success() { bail!("native candidate build failed; no fallback attempted"); }
+        let out = runner.run(&cmd)?;
+        if out.timed_out { return Err(CandidateTimeout.into()); }
+        if !out.success() { bail!("native candidate build failed; no fallback attempted"); }
         let binary = target.join("release/herdr-projects");
         let checksum = candidate_checksum(&binary)?;
         let out = runner.run(&candidate_command(Cmd::new(binary.to_string_lossy(), STEP_TIMEOUT), self.scratch.path())
             .cwd(self.scratch.path()).arg("--version"))?;
+        if out.timed_out { return Err(CandidateTimeout.into()); }
         if !out.success() { bail!("candidate executable cannot run"); }
         let reported = out.stdout.trim().strip_prefix("herdr-projects ").context("candidate executable identity mismatch")?;
         let (found_version, build) = reported.split_once('+').context("candidate build provenance missing")?;
@@ -694,6 +713,7 @@ fn candidate_git(runner: &dyn Runner, home: &Path, root: &Path, args: &[&str]) -
         .args(["-c", "core.hooksPath=/dev/null", "-c", "credential.helper="])
         .args(args.iter().copied());
     let out = runner.run(&cmd)?;
+    if out.timed_out { return Err(CandidateTimeout.into()); }
     if !out.success() { bail!("candidate Git step failed: {}", args[0]); }
     Ok(out.stdout.trim_end_matches('\n').into())
 }
@@ -828,6 +848,97 @@ mod tests {
             }
         }
     }
+
+    fn stage_timeout_fault(case: &'static str) {
+        let (live, _remote, _scratch, commit, staging) = staging_fixture();
+        std::fs::remove_file(live.path().join("notes")).unwrap();
+        std::fs::write(live.path().join(".git/info/exclude"), "/target/\n").unwrap();
+        let before = checkout_snapshot(live.path());
+        let runner = FakeRunner::new();
+        runner.on("plugin list", ok(&list(r#"{"kind":"local"}"#).replace("/p/root", live.path().to_str().unwrap())));
+        runner.on("rev-parse --show-prefix", ok(""));
+        runner.on("symbolic-ref --quiet HEAD", ok("refs/heads/main\n"));
+        runner.on("branch.main.merge", ok("refs/heads/main\n"));
+        runner.on("branch.main.remote", ok("origin\n"));
+        runner.on("remote.origin.url", ok("https://github.com/forgegod/eliasstravik-herdr-projects.git\n"));
+        runner.on("ls-remote", ok(&format!("{commit}\trefs/heads/main\n")));
+        let injected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let did_inject = injected.clone();
+        let built = std::rc::Rc::new(std::cell::Cell::new(false));
+        let did_build = built.clone();
+        let scratch = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let seen = scratch.clone();
+        let live_root = live.path().to_path_buf();
+        runner.on_fn(|_| true, move |cmd| {
+            assert!(!did_inject.get(), "command continued after timeout: {}", cmd.display());
+            assert!(cmd.own_group, "candidate command lost its process group");
+            let fetch = cmd.program == "git" && cmd.args.iter().any(|a| a == "fetch");
+            let build = cmd.program == "cargo";
+            let probe = cmd.args == ["--version"];
+            let guard = cmd.program == "git" && Path::new(&cmd.args[1]) == live_root
+                && did_build.get() && cmd.args.iter().any(|a| a == "ls-files");
+            assert_eq!(cmd.timeout, if build { BUILD_TIMEOUT } else if probe { STEP_TIMEOUT } else { GIT_TIMEOUT });
+            let inject = match case {
+                "fetch" => fetch,
+                "build" => build,
+                "probe" => probe,
+                "guard" => guard,
+                _ => unreachable!(),
+            };
+            if fetch {
+                *seen.borrow_mut() = Some(PathBuf::from(&cmd.args[1]).parent().unwrap().to_path_buf());
+            }
+            // Leave plausible successful output/artifacts behind: timed_out
+            // must win even over exit zero and a complete version response.
+            let mut out = if build {
+                did_build.set(true);
+                let target = PathBuf::from(cmd.args.last().unwrap());
+                std::fs::create_dir_all(target.join("release"))?;
+                std::fs::write(target.join("release/herdr-projects"), "synthetic candidate")?;
+                ok("")
+            } else if probe {
+                ok(&format!("herdr-projects 0.2.34+{}.123\n", &commit[..7]))
+            } else {
+                staging.run(cmd)?
+            };
+            assert!(out.success());
+            if inject {
+                did_inject.set(true);
+                out.timed_out = true;
+                out.stderr = "untrusted timeout output\n".repeat(1024);
+            }
+            Ok(out)
+        });
+        let home = tempfile::tempdir().unwrap();
+        let env = paths::Env::for_test(home.path(), &[("HERDR_SOCKET_PATH", "/synthetic/socket")]);
+        let ctx = Ctx { env: &env, root: home.path().join("projects"), config_dir: env.config_dir(), runner: &runner, detached_ticker: false };
+        let result = crate::cli::dispatch_test(&ctx, &["herdr-projects", "update", "--stage", "--channel", "branch", "--repository", "forgegod/eliasstravik-herdr-projects", "--ref", "main"]);
+        assert!(injected.get(), "timeout boundary not reached: {case}");
+        assert_eq!(before, checkout_snapshot(live.path()), "live HEAD/branch/files/index/remotes/binary changed: {case}");
+        let scratch = scratch.borrow().clone().expect("candidate fetch not reached");
+        assert!(!scratch.exists() && !scratch.parent().unwrap().exists(), "candidate scratch survived: {case}");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+        assert_eq!(runner.count("fetch"), 1);
+        assert_eq!(runner.count("cargo"), usize::from(case != "fetch"));
+        assert_eq!(runner.count("--version"), usize::from(matches!(case, "probe" | "guard")));
+        for forbidden in ["plugin install", "scripts/install", "doctor", "ticker", "docker", "--tags"] {
+            assert_eq!(runner.count(forbidden), 0, "unexpected {forbidden}");
+        }
+        let error = result.expect_err("stage accepted a timed-out candidate operation");
+        assert_eq!(format!("{error:#}"), "candidate verification failed: timed out; candidate cleaned up; no installation attempted", "{case}");
+    }
+
+    #[test]
+    fn candidate_stage_timeout_fetch_is_truthful() { stage_timeout_fault("fetch"); }
+
+    #[test]
+    fn candidate_stage_timeout_native_build_is_truthful() { stage_timeout_fault("build"); }
+
+    #[test]
+    fn candidate_stage_timeout_executable_probe_is_truthful() { stage_timeout_fault("probe"); }
+
+    #[test]
+    fn candidate_stage_timeout_final_live_guard_is_truthful() { stage_timeout_fault("guard"); }
 
     fn stage_completion_fault(case: &'static str) {
         use std::os::unix::fs::PermissionsExt;
