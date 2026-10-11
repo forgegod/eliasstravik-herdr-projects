@@ -9,8 +9,8 @@
 | --- | --- | --- | --- |
 | 1 | Explicit fork source and branch-channel discovery | done (`cargo test --offline --locked update && sh scripts/check-records.sh`: 24 filter matches and 73 record tests passed in the isolated Rust 1.89/Node 22 container; `git diff --check` passed) | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
 | 2 | Stage and verify candidates without changing the live checkout | done (`cargo test --offline --locked update && cargo test --offline --locked --test cli && sh scripts/check-records.sh`: 41 filter matches, 4 CLI tests and 73 record tests passed; durable scratch smoke gate passed; `git diff --check` passed) | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
-| 3 | Serialized promotion and explicit ticker recovery | pending | Operator selects the promotion/confirmation contract below before production edits; then `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0 and transactional failure matrix passes |
-| 4 | Fork documentation, current CAP and release integration | pending | `sh scripts/check.sh && git diff --check` exits 0; disposable install/update smoke and provenance review pass |
+| 3 | Serialized promotion and explicit ticker recovery | pending | Deferred by the operator's stage-only selection; a later promotion design must select a confirmation contract before `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` and the transactional failure matrix can apply |
+| 4 | Fork documentation, current CAP and release integration | pending | Deferred with phase 3: final integration cannot close this CHG while its proposed promotion scope remains unimplemented |
 
 ## Applicability and decision boundary
 
@@ -359,7 +359,22 @@ Source-backed boundaries:
   transaction decision. This phase's steps below are safety requirements, not
   approval of an unspecified interface.
 
-### Alternatives requiring operator selection
+### Operator selection — retain stage-only behavior
+
+The operator selected **B — retain stage-only branch behavior pending a future
+promotion design**. Phase 1/2 CLI and cleanup guarantees remain unchanged; no
+promotion command, persistent candidate receipt or fallback through ordinary
+release update is authorized. Stage success remains verification, not update
+success. This keeps CAP-004 current and does not create a new cross-cutting
+runtime decision: no behavior changed in this specification pass.
+
+CHG-002 remains `blocked` with phase 3 and final phase 4 pending. The completed
+check/stage work is retained as evidence, but final integration cannot close a
+record that promises a serialized promotion transaction. A future scoped change
+may resume or split this remaining work at the verified phase-2 boundary only
+after the operator selects a promotion contract.
+
+### Deferred promotion design
 
 **A — Design an explicit promotion confirmation/commit interface.** Add a new,
 opt-in `herdr-projects update --promote --channel branch --repository <owner>/<repo>[/<subdir>] --ref <ref>`
@@ -383,28 +398,28 @@ target). Neither `--promote` alone, an old check/stage success, an inherited
 follow the review's print-before-mutation requirement and the current disposable
 candidate boundary; neither is authorized by it.
 
-**B — Retain stage-only branch behavior pending a future promotion design.**
-Keep the phase-1/2 CLI and cleanup guarantees unchanged, add no promotion command,
-and defer this phase and dependent phase-4 promotion/integration acceptance.
-This is already supported by CAP-004 and `stage_branch`; it permits verification,
-not installation. Do not label stage success as update success, close CHG-002 as
-fully implemented, or use ordinary release update as a branch-promotion fallback.
+Before future promotion work can resume, the operator must select the
+one-invocation or preview/commit model, approve exact confirmation syntax and
+noninteractive policy, and define installation scope (linked, managed or both;
+binary-only versus matching plugin assets and managed provenance). They must also
+approve how project/Herdr config identity is bound across old/new executables,
+whether an initially absent ticker stays absent, what constitutes successful
+restart, and the rollback/degraded-state boundary after repair writes. Selecting
+that design authorizes contract specification, not an update of the active install.
 
-**Precise operator decision required:** Select A or B. If A, select the
-one-invocation or preview/commit model, approve its exact user-facing confirmation
-syntax and noninteractive policy, and define the transaction's installation
-scope (linked, managed or both; binary-only versus matching plugin assets and
-managed provenance). Approve how project/Herdr config identity is bound across
-old/new executables, whether an initially absent ticker stays absent, what
-constitutes successful restart, and the rollback/degraded-state boundary after
-repair writes. Until these choices are explicit in this CHG, implementation and
-behavior-test design remain blocked; no CLI flags or receipt format are assumed.
-Selecting A authorizes contract specification, not an update of the active install.
+Before future promotion work can resume, the operator must select the
+one-invocation or preview/commit model, approve exact confirmation syntax and
+noninteractive policy, and define installation scope (linked, managed or both;
+binary-only versus matching plugin assets and managed provenance). They must also
+approve how project/Herdr config identity is bound across old/new executables,
+whether an initially absent ticker stays absent, what constitutes successful
+restart, and the rollback/degraded-state boundary after repair writes. Selecting
+that design authorizes contract specification, not an update of the active install.
 
 ### Implementation requirements after the decision
 
-The following requirements remain pending. Refine their RED tests and exact
-transaction states from the selected contract before making production edits.
+The following requirements are deferred. Refine their RED tests and exact
+transaction states from the future selected contract before making production edits.
 
 1. Write RED tests for concurrent updates, stale locks, ticker-stop refusal,
    promotion failure, interrupted promotion, doctor failure, restart failure,
