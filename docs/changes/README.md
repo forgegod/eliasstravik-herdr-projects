@@ -70,7 +70,7 @@ the tracked plan; do not create a profile-private progress authority.
 | --- | --- |
 | [CHG-001 — Profile-safe Hermes integration](active/CHG-001-hermes-agent-integration.md) | blocked |
 | [CHG-002 — Fork-aware updates](active/CHG-002-fork-aware-updates.md) | blocked |
-| [CHG-003 — Reconciled OMP input-box compatibility](active/CHG-003-omp-input-box-compatibility.md) | planned |
+| [CHG-003 — Reconciled OMP input-box compatibility](active/CHG-003-omp-input-box-compatibility.md) | in-progress |
 
 ## Archive
 

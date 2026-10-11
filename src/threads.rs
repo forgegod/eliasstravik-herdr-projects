@@ -523,6 +523,15 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+    prompt_with_policy(ctx, slug, id, text, false)
+}
+
+/// Automatic follow-ups must also pass the parser's delivery policy gate.
+pub fn prompt_automatic(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+    prompt_with_policy(ctx, slug, id, text, true)
+}
+
+fn prompt_with_policy(ctx: &Ctx, slug: &str, id: &str, text: &str, automatic: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
@@ -542,6 +551,9 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     // their text and submitted. A box this binary cannot read (another kind, a
     // layout it does not know) is sent to as before.
     let kind = agents.iter().find(|a| thread::agent_matches(&record, a)).map(|a| a.agent.as_str()).unwrap_or(&record.agent);
+    if automatic && !crate::prompt_box::delivery_enabled(kind) {
+        bail!("automatic delivery is not enabled for {kind}");
+    }
     let screen = herdr.agent_screen(&record.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
     // Herdr may read a trust screen as idle; Enter there would accept it.
     if let Some(phrase) = crate::trust_screen::detect(kind, &screen) {

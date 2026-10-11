@@ -30,11 +30,11 @@ const PHRASES: &[&str] = &[
 ];
 
 /// The trust-screen line on `screen` (`agent read --format ansi`), or `None`.
-/// A screen whose input box is visible and empty is the agent's prompt, and a
+/// For delivery-enabled kinds, a visible empty input box is the agent's prompt, and a
 /// phrase on it is only transcript text (an agent quoting a dialog); menus,
 /// dialogs and unknown layouts have no empty box.
 pub fn detect(kind: &str, screen: &str) -> Option<&'static str> {
-    if prompt_box::check(kind, screen) == Draft::Empty {
+    if prompt_box::delivery_enabled(kind) && prompt_box::check(kind, screen) == Draft::Empty {
         return None;
     }
     let plain = plain_text(screen);
@@ -111,6 +111,13 @@ mod tests {
         assert!(detect("copilot", "Confirm folder trust\n❯ 1. Yes\n").is_some());
         // Styling between words does not hide it.
         assert!(detect("kiro", "Hooks \u{1b}[1mneed\u{1b}[0m   review\n").is_some());
+    }
+
+    #[test]
+    fn omp_parser_empty_does_not_dismiss_a_trust_screen() {
+        let screen = "Trust this folder?\n╰─ \n";
+        assert_eq!(prompt_box::check("omp", screen), Draft::Empty);
+        assert_eq!(detect("omp", screen), Some("Trust this folder?"));
     }
 
     #[test]

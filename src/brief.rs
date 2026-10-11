@@ -116,6 +116,10 @@ fn step(project: &Project, herdr: &Herdr, t: &mut Thread, agent: &Agent, sender:
         t.brief_seen.clear();
         return Ok(Outcome::TrustScreen(phrase));
     }
+    if sender == Sender::Ticker && !prompt_box::delivery_enabled(kind) {
+        t.brief_seen.clear();
+        return Ok(Outcome::Waiting(format!("automatic delivery is not enabled for {kind}")));
+    }
     let known = prompt_box::knows(kind);
     let in_box = prompt_box::box_text(kind, &screen);
     let line = squeeze(&marker(&project.slug, &t.id));
@@ -279,6 +283,52 @@ mod tests {
 
     fn prompts(world: &World) -> usize {
         world.runner.count("agent prompt")
+    }
+
+    #[test]
+    fn omp_ticker_brief_reports_a_trust_screen_before_the_delivery_gate() {
+        let (world, project, _) = world("idle");
+        thread::update(&project, "t-0001", |t| t.agent = "omp".into()).unwrap();
+        let agents = world.agents.borrow().replace("\"claude\"", "\"omp\"");
+        *world.agents.borrow_mut() = agents;
+        *world.screen.borrow_mut() = "Trust this folder?\n╰─ ".into();
+        let agents: Vec<Agent> = serde_json::from_str(&world.agents.borrow()).unwrap();
+        let coordinator = project.coordinator().unwrap();
+        let herdr = Herdr::new(world.env.herdr_bin(), &coordinator.socket, &world.runner);
+
+        let outcome = deliver(&project, &herdr, &record(&project), &agents[0], Sender::Ticker).unwrap();
+
+        assert_eq!(outcome, Outcome::TrustScreen("Trust this folder?"));
+        assert_eq!(prompts(&world), 0, "nothing is typed into a trust screen");
+        assert_eq!(world.runner.count("send-keys"), 0, "no trust option is accepted");
+        let held = record(&project);
+        assert!(held.prompt_pending && held.brief_claimed.is_empty());
+        assert_eq!(held.brief_attempts, 0);
+    }
+
+    #[test]
+    fn omp_parser_support_does_not_enable_automatic_brief_delivery() {
+        let (world, project, _) = world("idle");
+        let ctx = world.ctx();
+        thread::update(&project, "t-0001", |t| t.agent = "omp".into()).unwrap();
+        let agents = world.agents.borrow().replace("\"claude\"", "\"omp\"");
+        *world.agents.borrow_mut() = agents;
+        for (attempts, screen) in [
+            (0, "╰─ \n".to_string()),
+            (1, "╰─ \n".to_string()),
+            (1, format!("╰─ {}\n", line())),
+            (1, format!("{}\n╰─ \n", line())),
+        ] {
+            thread::update(&project, "t-0001", |t| t.brief_attempts = attempts).unwrap();
+            *world.screen.borrow_mut() = screen;
+            for _ in 0..2 {
+                assert!(pass(&ctx), "the OMP brief must remain pending");
+                settled(&project);
+            }
+            assert_eq!(prompts(&world), 0, "OMP must not type or retry automatically");
+            assert_eq!(world.runner.count("send-keys"), 0, "OMP must not submit a prior try");
+            assert!(record(&project).prompt_pending, "OMP parser output must not confirm delivery");
+        }
     }
 
     #[test]

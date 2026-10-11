@@ -30,6 +30,7 @@ fn placeholders(kind: &str) -> &'static [&'static str] {
 struct Cell {
     ch: char,
     dim: bool,
+    italic: bool,
     reverse: bool,
     bg: String,
 }
@@ -41,11 +42,12 @@ fn text(line: &[Cell]) -> String {
 }
 
 /// Screen text with SGR styling into cells. Other escape sequences are
-/// skipped; only dim, reverse and the background colour are kept.
+/// skipped; only dim, italic, reverse and the background colour are kept.
 fn parse(screen: &str) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut line = Line::new();
     let (mut dim, mut reverse, mut bg) = (false, false, String::new());
+    let mut italic = false;
     let mut chars = screen.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
@@ -65,13 +67,13 @@ fn parse(screen: &str) -> Vec<Line> {
                     params.push(c);
                 }
                 if last == 'm' {
-                    sgr(&params, &mut dim, &mut reverse, &mut bg);
+                    sgr(&params, &mut dim, &mut italic, &mut reverse, &mut bg);
                 }
             }
             '\n' => lines.push(std::mem::take(&mut line)),
             '\r' => {}
             c if c.is_control() => {}
-            c => line.push(Cell { ch: c, dim, reverse, bg: bg.clone() }),
+            c => line.push(Cell { ch: c, dim, italic, reverse, bg: bg.clone() }),
         }
     }
     if !line.is_empty() {
@@ -80,18 +82,21 @@ fn parse(screen: &str) -> Vec<Line> {
     lines
 }
 
-fn sgr(params: &str, dim: &mut bool, reverse: &mut bool, bg: &mut String) {
+fn sgr(params: &str, dim: &mut bool, italic: &mut bool, reverse: &mut bool, bg: &mut String) {
     let codes: Vec<&str> = if params.is_empty() { vec!["0"] } else { params.split(';').collect() };
     let mut i = 0;
     while i < codes.len() {
         match codes[i] {
             "0" | "" => {
                 *dim = false;
+                *italic = false;
                 *reverse = false;
                 bg.clear();
             }
             "2" => *dim = true,
             "22" => *dim = false,
+            "3" => *italic = true,
+            "23" => *italic = false,
             "7" => *reverse = true,
             "27" => *reverse = false,
             "49" => bg.clear(),
@@ -147,6 +152,76 @@ fn typed(cells: &[Cell]) -> String {
         out.push(c.ch);
     }
     out
+}
+
+/// Only a whole, padded hint row is decorative. Never walk backward through
+/// arbitrary tokens: a draft next to a hint must remain intact.
+fn omp_hint(row: &[Cell]) -> bool {
+    let Some(start) = row.iter().position(|c| !c.ch.is_whitespace()) else { return false };
+    let end = row.iter().rposition(|c| !c.ch.is_whitespace()).unwrap() + 1;
+    if start < 2 || !row[..start].iter().all(|c| c.ch == ' ') {
+        return false;
+    }
+    let content = &row[start..end];
+    for key in ["⇧⇥", "\u{f0636} \u{f0312}"] {
+        if text(content) == format!("{key} to change thinking effort") {
+            let label = key.chars().count() + 1;
+            return content[..label].iter().all(|c| !c.italic)
+                && content[label..].iter().all(|c| c.italic);
+        }
+    }
+    false
+}
+
+/// OMP hint recognition requires intact SGR-only captures. The shared parser
+/// is deliberately permissive for older adapters; do not change their policy.
+fn omp_ansi_complete(screen: &str) -> bool {
+    let mut chars = screen.chars();
+    let mut italic = false;
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            if ch.is_control() && !matches!(ch, '\r' | '\n') {
+                return false;
+            }
+            continue;
+        }
+        if chars.next() != Some('[') {
+            return false;
+        }
+        let mut params = String::new();
+        loop {
+            match chars.next() {
+                Some('m') => break,
+                Some(c) if c.is_ascii_digit() || c == ';' => params.push(c),
+                _ => return false,
+            }
+        }
+        let codes: Vec<&str> = params.split(';').collect();
+        let mut i = 0;
+        while i < codes.len() {
+            match codes[i] {
+                "" | "0" | "23" => italic = false,
+                "3" => italic = true,
+                "38" | "48" => {
+                    let count = match codes.get(i + 1) {
+                        Some(&"5") => 1,
+                        Some(&"2") => 3,
+                        _ => return false,
+                    };
+                    let Some(values) = codes.get(i + 2..i + 2 + count) else { return false };
+                    if values.iter().any(|v| v.parse::<u8>().is_err()) {
+                        return false;
+                    }
+                    i += count + 1;
+                }
+                "1" | "2" | "4" | "7" | "22" | "24" | "27" | "39" | "49" => {}
+                code if code.parse::<u8>().is_ok_and(|n| matches!(n, 30..=37 | 40..=47 | 90..=107)) => {}
+                _ => return false,
+            }
+            i += 1;
+        }
+    }
+    !italic
 }
 
 /// The input box's cells, one entry per line, or `None` when it is not on
@@ -211,6 +286,20 @@ fn input_box(kind: &str, lines: &[Line]) -> Option<Vec<Line>> {
             let top = (0..bottom).rev().find(|&i| is_rule(&lines[i]))?;
             Some(lines[top + 1..bottom].to_vec())
         }
+        // Default OMP editor; continuation and menu rows remain input.
+        "omp" => {
+            let at = last(&|_, l| {
+                let t = text(l);
+                t.trim_end() == "╰─" || t.starts_with("╰─ ")
+            })?;
+            let mut first = after(&lines[at], '─')?;
+            if omp_hint(&first) {
+                first.clear();
+            }
+            let mut rows = vec![first];
+            rows.extend(lines[at + 1..].iter().cloned());
+            Some(rows)
+        }
         _ => None,
     }
 }
@@ -228,18 +317,31 @@ pub fn check(kind: &str, screen: &str) -> Draft {
 /// The text typed in the input box, its lines joined by spaces (empty for an
 /// empty box), or `None` when the box is not on the screen.
 pub fn box_text(kind: &str, screen: &str) -> Option<String> {
+    if kind == "omp" && !omp_ansi_complete(screen) {
+        return None;
+    }
     let lines = parse(screen);
     let rows = input_box(kind, &lines)?;
-    let typed: Vec<String> = rows.iter().map(|row| typed(row).trim().to_string()).filter(|t| !t.is_empty()).collect();
+    // OMP has only the explicitly recognized hint, not generic dim placeholders.
+    let typed: Vec<String> = rows.iter().map(|row| {
+        if kind == "omp" { text(row) } else { typed(row) }.trim().to_string()
+    }).filter(|t| !t.is_empty()).collect();
     match typed.as_slice() {
         [only] if placeholders(kind).iter().any(|p| only.starts_with(p)) => Some(String::new()),
         _ => Some(typed.join(" ")),
     }
 }
 
-/// True for the kinds whose input box this module can find.
+/// Whether parser results may authorize automatic delivery or dismiss a trust
+/// screen. OMP parsing remains available to explicit callers until its automatic
+/// safety gate is explicitly enabled; recognizing a layout is not permission.
+pub fn delivery_enabled(kind: &str) -> bool {
+    kind != "omp"
+}
+
+/// True for the kinds whose input box this module can find, not delivery policy.
 pub fn knows(kind: &str) -> bool {
-    matches!(kind, "claude" | "codex" | "cursor" | "gemini" | "opencode" | "pi")
+    matches!(kind, "claude" | "codex" | "cursor" | "gemini" | "opencode" | "pi" | "omp")
 }
 
 /// The screen's plain text, styling dropped.
@@ -253,6 +355,84 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{}/tests/fixtures/prompt_box/{name}.ansi", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    #[test]
+    fn omp_default_empty_editor_is_readable() {
+        // Synthetic default-layout fragment, not a runtime capture.
+        assert_eq!(check("omp", "╰─ \n"), Draft::Empty);
+        assert_eq!(box_text("omp", "╰─ \n").as_deref(), Some(""));
+        assert!(knows("omp"));
+    }
+
+    #[test]
+    fn omp_default_hints_do_not_consume_adjacent_drafts() {
+        // Synthetic fragments based on the pinned default and nerd key glyphs.
+        // No runtime version, terminal dimensions or live capture is claimed.
+        for key in ["⇧⇥", "\u{f0636} \u{f0312}"] {
+            let hint = format!("{key} \u{1b}[3mto change thinking effort\u{1b}[0m");
+            assert_eq!(check("omp", &format!("╰─     {hint}\n")), Draft::Empty, "{key}");
+            for draft in ["hello", "one space token chain", "⇧⇥", "\u{1b}[3mitalic draft\u{1b}[23m"] {
+                for gap in ["", " ", "    "] {
+                    let screen = format!("╰─ {draft}{gap}{hint}\n");
+                    assert_eq!(check("omp", &screen), Draft::Typed, "{screen:?}");
+                    assert!(box_text("omp", &screen).unwrap().starts_with(&plain(draft)));
+                }
+            }
+        }
+        // Italics alone, unstyled lookalikes, truncated or wrapped labels are not hints.
+        for row in [
+            "    ⇧⇥ to change thinking effort",
+            "    words \u{1b}[3mto change thinking effort\u{1b}[0m",
+            "    ⇧⇥ \u{1b}[3mto change thinking\u{1b}[0m",
+            "    ⇧⇥ \u{1b}[3mto change\u{1b}[0m\n    thinking effort",
+            "\u{1b}[3mmy note\u{1b}[0m",
+        ] {
+            assert_eq!(check("omp", &format!("╰─ {row}\n")), Draft::Typed, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn omp_default_preserves_styled_drafts_and_continuations() {
+        // Synthetic: dim is not evidence of an OMP placeholder.
+        for draft in ["hello draft", "\u{1b}[2mhello draft\u{1b}[0m", "\u{1b}[7mh\u{1b}[0mello draft"] {
+            assert_eq!(box_text("omp", &format!("╰─ {draft}\n")).as_deref(), Some("hello draft"));
+            assert_eq!(box_text("omp", &format!("╰─ \n   {draft}\n   second line\n")).as_deref(), Some("hello draft second line"));
+        }
+        assert_eq!(box_text("omp", "╰─ narrow\n   wrapped draft\n").as_deref(), Some("narrow wrapped draft"));
+        assert_eq!(check("omp", "finished reply\n╰─ \n"), Draft::Empty);
+        // Draft detection is not readiness: the caller separately gates working agents.
+        assert_eq!(check("omp", "Working…\n╰─ \n"), Draft::Empty);
+        assert_eq!(check("omp", "Working…\n"), Draft::Unknown);
+        assert_eq!(check("omp", "╰─ /\n❯ setup\n  exit\n"), Draft::Typed);
+        assert_eq!(check("omp", "╰─ \n\u{1b}[2m❯ setup\u{1b}[0m\n"), Draft::Typed);
+        for screen in ["", "╭── omp ──╮\n╰─────────╯\n", "▎ \nmodel status\n", " ╰─ \n", "╰", "╰─x"] {
+            assert_eq!(check("omp", screen), Draft::Unknown, "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn omp_default_malformed_ansi_is_unknown() {
+        // Synthetic broken captures must not hide a draft inside an escape.
+        for suffix in [
+            "\u{1b}", "\u{1b}[", "\u{1b}[2", "\u{1b}[2\ndraft",
+            "\u{1b}[38;2;1m", "\u{1b}[38;5m", "\u{1b}[38;2;999;0;0m",
+            "\u{1b}[?3m", "\u{1b}[3:1m", "\u{1b}[2K", "\u{1b}]draft",
+            "\u{1b}[3m", "\u{8}", "\t",
+        ] {
+            let screen = format!("╰─ {suffix}");
+            assert_eq!(check("omp", &screen), Draft::Unknown, "{screen:?}");
+            assert_eq!(box_text("omp", &screen), None);
+        }
+        for reset in ["\u{1b}[0m", "\u{1b}[23m", "\u{1b}[m"] {
+            let screen = format!("╰─     ⇧⇥ \u{1b}[3;38;2;107;114;128mto change thinking effort{reset}\n");
+            assert_eq!(check("omp", &screen), Draft::Empty);
+        }
+        assert_eq!(check("omp", "╰─     ⇧⇥ \u{1b}[3mto change thinking effort"), Draft::Unknown);
+        assert_eq!(check("omp", "╰─ ⇧⇥ \u{1b}[3mto change thinking effort\u{1b}[0m"), Draft::Typed);
+        assert_eq!(check("omp", "╰─     ⇧⇥ \u{1b}[3mto change thinking effort\u{1b}[23m extra"), Draft::Typed);
+        // RGB components equal to SGR codes must not change italic state.
+        assert_eq!(check("omp", "╰─     ⇧⇥ \u{1b}[38;2;3;23;0mto change thinking effort\u{1b}[0m"), Draft::Typed);
     }
 
     #[test]

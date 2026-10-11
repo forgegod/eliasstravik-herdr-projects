@@ -356,7 +356,9 @@ fn forget_box(state: &mut State) {
 /// the wait over.
 fn box_quiet(state: &mut State, herdr: &Herdr, pane: &crate::coordinator::LivePane, now: jiff::Timestamp) -> Result<bool> {
     let screen = herdr.agent_screen(&pane.pane_id).map_err(|error| anyhow::anyhow!("{error}"))?;
-    if crate::prompt_box::check(&pane.agent, &screen) != crate::prompt_box::Draft::Empty {
+    if !crate::prompt_box::delivery_enabled(&pane.agent)
+        || crate::prompt_box::check(&pane.agent, &screen) != crate::prompt_box::Draft::Empty
+    {
         forget_box(state);
         return Ok(false);
     }
@@ -546,7 +548,7 @@ fn fire_pr_routines(ctx: &Ctx, project: &Project, t: &Thread, url: &str, events:
             continue;
         }
         let prompt = pr_routine_prompt(&r.name, &r.prompt, url, &hit, summary);
-        let (event, outcome) = match threads::prompt(ctx, &project.slug, &t.id, &prompt) {
+        let (event, outcome) = match threads::prompt_automatic(ctx, &project.slug, &t.id, &prompt) {
             Ok(state) => ("prompted its thread", format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", "))),
             Err(error) => ("could not prompt its thread", format!("could not prompt {} about {}: {error:#}", t.id, hit.join(", "))),
         };

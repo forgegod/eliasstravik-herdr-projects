@@ -883,6 +883,36 @@ fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     assert_eq!(nudges(&world).len(), 2);
 }
 
+#[test]
+fn omp_default_empty_cannot_advance_the_nudge_quiet_gate() {
+    let (world, project, _) = finished_world("idle");
+    set_front_matter(&project, "nudge = true");
+    settle(&project);
+    inbox::write(&project, "pr", "t-0001", "PR merged", "merged", "").unwrap();
+    let mut agents: serde_json::Value = serde_json::from_str(&world.agents.borrow()).unwrap();
+    agents[0]["agent"] = "omp".into();
+    *world.agents.borrow_mut() = agents.to_string();
+    // Synthetic default-editor fragment, not a live capture.
+    *world.screen.borrow_mut() = "╰─ \n".into();
+    assert_eq!(crate::prompt_box::check("omp", &world.screen.borrow()), crate::prompt_box::Draft::Empty);
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    idle_for_a_minute(&project);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert_eq!(coordinator::live(&project)[0].agent, "omp");
+    assert!(world.runner.count("agent read") > 0, "the real quiet gate must read the screen");
+    let mut state = crate::steps::load_state(&project);
+    assert!(state.box_empty_since.is_empty(), "parser Empty must not start OMP's automatic quiet interval");
+    // A previously persisted interval must not authorize a later send either.
+    state.box_pane = "w1:p1".into();
+    state.box_empty_since = "2026-01-01T00:00:00Z".into();
+    crate::steps::save_state(&project, &state).unwrap();
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    assert!(crate::steps::load_state(&project).box_empty_since.is_empty());
+    assert!(nudges(&world).is_empty());
+}
+
 /// The bug a user reported: the nudge was typed into the coordinator's box
 /// while they were typing there, merged into their text and submitted it.
 #[test]
@@ -1030,6 +1060,26 @@ fn pr_world(gh_json: &'static str) -> (World, Project) {
     std::fs::write(thread::home_report_path(&project, "t-0001"), format!("PR: {PR_URL}\n## Report\nx\n")).unwrap();
     world.runner.on("gh pr view", ok(gh_json));
     (world, project)
+}
+
+#[test]
+fn omp_default_empty_does_not_enable_automatic_pr_follow_up() {
+    let (world, project) = pr_world(
+        r#"{"state":"OPEN","reviewDecision":"","headRefName":"hp/demo/t-0001-task","headRepository":{"name":"app"},"headRepositoryOwner":{"login":"owner"},"statusCheckRollup":[],"comments":[{"author":{"login":"reviewer"}}]}"#,
+    );
+    thread::update(&project, "t-0001", |t| t.agent = "omp".into()).unwrap();
+    let agents = world.agents.borrow().replace("\"claude\"", "\"omp\"");
+    *world.agents.borrow_mut() = agents;
+    *world.screen.borrow_mut() = "╰─ \n".into();
+    ticker::tick_project(&world.ctx(), &project).unwrap();
+    assert_eq!(items_of(&project, "pr").len(), 1, "the PR event must reach the routine");
+    assert_eq!(world.runner.count("agent prompt"), 0, "OMP routines must not send automatically");
+    let items = items_of(&project, "routine");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].event, "could not prompt its thread");
+    // Explicit follow-ups still work; the policy gate is for automatic senders.
+    threads::prompt(&world.ctx(), "demo", "t-0001", "Manual follow-up.").unwrap();
+    assert_eq!(world.runner.count("agent prompt"), 1);
 }
 
 #[test]
