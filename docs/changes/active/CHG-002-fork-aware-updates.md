@@ -7,8 +7,8 @@
 
 | # | Phase | Status | Verification gate |
 | --- | --- | --- | --- |
-| 1 | Explicit fork source and branch-channel discovery | in-progress | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
-| 2 | Stage and verify candidates without changing the live checkout | pending | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
+| 1 | Explicit fork source and branch-channel discovery | done (`cargo test --offline --locked update && sh scripts/check-records.sh`: 24 filter matches and 73 record tests passed in the isolated Rust 1.89/Node 22 container; `git diff --check` passed) | `cargo test --locked update && sh scripts/check-records.sh` exits 0; same-version branch/provenance cases pass |
+| 2 | Stage and verify candidates without changing the live checkout | in-progress | `cargo test --locked update && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; disposable-remotes staging/failure cases pass |
 | 3 | Serialized promotion and explicit ticker recovery | pending | `cargo test --locked update && cargo test --locked ticker && cargo test --locked --test cli && sh scripts/check-records.sh` exits 0; transactional failure matrix passes |
 | 4 | Fork documentation, current CAP and release integration | pending | `sh scripts/check.sh && git diff --check` exits 0; disposable install/update smoke and provenance review pass |
 
@@ -163,6 +163,19 @@ behaviour and phase gate are verified.
   `docs/changes/AGENTS.md` remain applicable and unchanged: no ownership,
   durable workflow or child index changed. The final phase DOX pass and evidence
   update remain required before completion.
+
+### Phase 1 implementation evidence
+
+- The selected check-only CLI, source/ref/provenance refusal, candidate validation,
+  truthful unverified installed-commit report and checkout-history classification
+  are implemented in `src/cli.rs` and `src/update.rs`.
+- Tests use injected runners plus disposable local Git repositories. The history
+  safety regressions have mutation-backed RED→GREEN evidence; their temporary
+  wrong classifications failed assertions, the exact implementation was restored
+  byte-for-byte, and each test passed green.
+- The phase gate passed in the isolated Rust 1.89/Node 22 container: 24 `update`
+  filter matches and 73 record tests passed. `git diff --check` passed. CAP-004
+  now describes the implemented check-only boundary; later phases remain pending.
 
 ## Phase 2 — Stage and verify candidates without changing the live checkout
 

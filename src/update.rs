@@ -283,6 +283,53 @@ fn branch_git(runner: &dyn Runner, root: &Path, args: &[&str]) -> Result<String>
     Ok(out.stdout.trim_end_matches('\n').to_string())
 }
 
+/// Only local objects are acquired, into a disposable bare repository. This
+/// compares checkout history, never the unverified installed executable.
+fn checkout_history(runner: &dyn Runner, root: &Path, candidate: &str) -> Result<String> {
+    let head = branch_git(runner, root, &["rev-parse", "--verify", "HEAD"])?;
+    if !full_oid(&head) { bail!("invalid checkout commit"); }
+    let source = std::fs::canonicalize(root)?;
+    let scratch = tempfile::tempdir()?;
+    let objects = scratch.path().join("history.git");
+    let isolated = |root: &Path| {
+        let mut cmd = git(root, GIT_TIMEOUT).own_group()
+            .env("HOME", scratch.path().to_string_lossy())
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0").env("GIT_CONFIG_PARAMETERS", "")
+            .env("GIT_NO_REPLACE_OBJECTS", "1").env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "file").env("GIT_OPTIONAL_LOCKS", "0");
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SHALLOW_FILE"] {
+            cmd = cmd.env_remove(key);
+        }
+        cmd
+    };
+    let out = runner.run(&isolated(scratch.path()).args([
+        "clone", "--local", "--no-hardlinks", "--bare", "--no-checkout", "--template=", "--",
+        &source.to_string_lossy(), &objects.to_string_lossy(),
+    ]))?;
+    if !out.success() { bail!("local objects unavailable"); }
+    let shallow = runner.run(&isolated(&objects).args(["rev-parse", "--is-shallow-repository"]))?;
+    if !shallow.success() || shallow.stdout.trim() != "false" { bail!("incomplete ancestry"); }
+    // Validate both complete parent walks before interpreting merge-base's 1
+    // as non-ancestry. Missing objects must not become a divergence verdict.
+    let walk = runner.run(&isolated(&objects).args(["rev-list", "--parents", &head, candidate, "--"]))?;
+    if !walk.success() { bail!("missing ancestry objects"); }
+    let ancestor = |older: &str, newer: &str| -> Result<bool> {
+        let out = runner.run(&isolated(&objects).args(["merge-base", "--is-ancestor", older, newer]))?;
+        match (out.code, out.timed_out) {
+            (Some(0), false) => Ok(true),
+            (Some(1), false) => Ok(false),
+            _ => bail!("ancestry unavailable"),
+        }
+    };
+    let relation = if head == candidate { "equal" }
+        else if ancestor(&head, candidate)? { "candidate-ahead" }
+        else if ancestor(candidate, &head)? { "checkout-ahead" }
+        else { "diverged" };
+    Ok(format!("checkout commit: {head}\ncheckout history: {relation}\n"))
+}
+
 pub fn check_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<String> {
     let repository = repository_arg(repository).map_err(anyhow::Error::msg)?;
     let reference = branch_ref_arg(reference).map_err(anyhow::Error::msg)?;
@@ -354,7 +401,10 @@ pub fn check_branch(ctx: &Ctx, repository: &str, reference: &str) -> Result<Stri
     if !full_oid(candidate) || found_ref != reference {
         bail!("invalid candidate commit or ref");
     }
-    Ok(format!("repository: {repository}\nref: {reference}\ninstalled commit: unverified\ncandidate commit: {candidate}\n"))
+    let history = checkout_history(ctx.runner, install.root(), candidate).unwrap_or_else(|_| {
+        "checkout history: unavailable (local ancestry missing or unreadable; no network acquisition attempted)\n".into()
+    });
+    Ok(format!("repository: {repository}\nref: {reference}\ninstalled commit: unverified\ncandidate commit: {candidate}\n{history}installed history: unavailable (installed commit unverified)\n"))
 }
 
 pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
@@ -427,6 +477,154 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
 
     const HEAD: &str = "1111111111111111111111111111111111111111";
+
+    struct HistoryRunner {
+        root: PathBuf,
+        candidate: String,
+    }
+
+    impl Runner for HistoryRunner {
+        fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+            use crate::runner::RealRunner;
+            if cmd.program != "git" {
+                return Ok(ok(&list(r#"{"kind":"local"}"#).replace("/p/root", self.root.to_str().unwrap())));
+            }
+            if cmd.args.iter().any(|a| a == "ls-remote") {
+                if self.candidate == "offline" { return Ok(fail(128, "offline")); }
+                return Ok(ok(&format!("{}\trefs/heads/main\n", self.candidate)));
+            }
+            if cmd.args.iter().any(|a| a == "config") {
+                return branch_runner().run(cmd);
+            }
+            for forbidden in ["fetch", "pull", "checkout", "switch", "remote"] {
+                assert!(!cmd.args.iter().any(|a| a == forbidden), "unexpected command: {}", cmd.display());
+            }
+            if cmd.args.iter().any(|a| a == "clone") {
+                assert_ne!(Path::new(&cmd.args[1]), self.root, "clone runs in live installation");
+            }
+            RealRunner.run(cmd)
+        }
+
+        fn socket_request(&self, _: &Path, _: &str, _: Duration) -> Result<String> {
+            panic!("unexpected socket request")
+        }
+
+        fn run_foreground(&self, _: &Cmd, _: &mut dyn FnMut() -> bool) -> Result<Option<i32>> {
+            panic!("unexpected foreground command")
+        }
+    }
+
+    fn local_git(root: &Path, args: &[&str]) -> String {
+        let out = crate::runner::RealRunner.run(&git(root, GIT_TIMEOUT)
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Test").env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test").env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .args(args.iter().copied())).unwrap();
+        assert!(out.success(), "{}", out.error_text());
+        out.stdout.trim().to_string()
+    }
+
+    fn local_history() -> (tempfile::TempDir, String, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        local_git(root, &["init", "--initial-branch=main"]);
+        std::fs::write(root.join("Cargo.toml"), "version = '0.2.34'\n").unwrap();
+        local_git(root, &["add", "Cargo.toml"]);
+        local_git(root, &["commit", "-m", "base"]);
+        let base = local_git(root, &["rev-parse", "HEAD"]);
+        let tree = local_git(root, &["rev-parse", "HEAD^{tree}"]);
+        let next = local_git(root, &["commit-tree", &tree, "-p", &base, "-m", "same version"]);
+        let fork = local_git(root, &["commit-tree", &tree, "-p", &base, "-m", "fork"]);
+        (dir, base, next, fork)
+    }
+
+    fn checkout_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, path: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { walk(root, &path, files); }
+                else { files.insert(path.strip_prefix(root).unwrap().into(), std::fs::read(path).unwrap()); }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        walk(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn branch_history_same_version_candidate_ahead_needs_ancestry_not_sha_inequality() {
+        let (dir, base, next, _) = local_history();
+        assert_ne!(base, next);
+        assert_eq!(local_git(dir.path(), &["show", &format!("{base}:Cargo.toml")]),
+            local_git(dir.path(), &["show", &format!("{next}:Cargo.toml")]));
+        let before = checkout_snapshot(dir.path());
+        let runner = HistoryRunner { root: dir.path().into(), candidate: next };
+        let report = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").unwrap();
+        assert_eq!(before, checkout_snapshot(dir.path()), "live checkout mutated");
+        assert!(report.contains("checkout history: candidate-ahead\n"), "{report}");
+        assert!(report.contains("installed commit: unverified\n"), "{report}");
+        assert!(report.contains("installed history: unavailable (installed commit unverified)\n"), "{report}");
+    }
+
+    #[test]
+    fn branch_history_classifies_equal_checkout_ahead_and_diverged_without_install_claims() {
+        let (dir, base, next, fork) = local_history();
+        for (head, candidate, expected) in [
+            (&base, &base, "equal"),
+            (&next, &base, "checkout-ahead"),
+            (&base, &next, "candidate-ahead"),
+            (&next, &fork, "diverged"),
+        ] {
+            // All three unequal pairs have the same SHA inequality, but
+            // different ancestry. HEAD is only a checkout, not binary proof.
+            local_git(dir.path(), &["update-ref", "refs/heads/main", head]);
+            std::fs::write(dir.path().join("untracked"), "preserve me").unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "dirty, preserve me").unwrap();
+            let before = checkout_snapshot(dir.path());
+            let runner = HistoryRunner { root: dir.path().into(), candidate: candidate.clone() };
+            let report = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main").unwrap();
+            assert_eq!(before, checkout_snapshot(dir.path()), "live checkout mutated");
+            assert!(report.contains(&format!("checkout history: {expected}\n")), "{report}");
+            assert!(report.contains("installed commit: unverified\n"), "{report}");
+            assert!(report.contains("installed history: unavailable (installed commit unverified)\n"), "{report}");
+            assert!(!report.contains("installed-ahead"), "invented binary provenance: {report}");
+        }
+    }
+
+    #[test]
+    fn branch_history_refuses_missing_candidate_parent_shallow_and_offline_without_mutation() {
+        for case in ["missing-candidate", "missing-parent", "shallow", "offline"] {
+            let (dir, base, next, fork) = local_history();
+            local_git(dir.path(), &["update-ref", "refs/heads/main", &next]);
+            let candidate = match case {
+                "missing-candidate" => {
+                    std::fs::remove_file(dir.path().join(".git/objects").join(&fork[..2]).join(&fork[2..])).unwrap();
+                    fork
+                }
+                "missing-parent" => {
+                    std::fs::remove_file(dir.path().join(".git/objects").join(&base[..2]).join(&base[2..])).unwrap();
+                    fork
+                }
+                "shallow" => {
+                    std::fs::write(dir.path().join(".git/shallow"), format!("{next}\n")).unwrap();
+                    fork
+                }
+                _ => "offline".into(),
+            };
+            let before = checkout_snapshot(dir.path());
+            let runner = HistoryRunner { root: dir.path().into(), candidate };
+            let result = branch_check(&runner, "forgegod/eliasstravik-herdr-projects", "main");
+            assert_eq!(before, checkout_snapshot(dir.path()), "live checkout mutated: {case}");
+            if case == "offline" {
+                assert!(result.unwrap_err().to_string().contains("could not query selected branch"));
+            } else {
+                let report = result.unwrap();
+                assert!(report.contains("checkout history: unavailable (local ancestry missing or unreadable; no network acquisition attempted)\n"), "{case}: {report}");
+                assert!(report.contains("installed commit: unverified\n"), "{report}");
+                assert!(report.contains("installed history: unavailable (installed commit unverified)\n"), "{report}");
+            }
+        }
+    }
 
     fn branch_runner() -> FakeRunner {
         branch_runner_with(|_| {})

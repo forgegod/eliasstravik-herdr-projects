@@ -14,6 +14,7 @@ All Rust modules and their colocated unit/scenario tests. `main.rs` enters `cli.
 - Keep project/runtime data separate from user-owned safety/configuration. Preserve atomic writes and pane/socket/terminal identity checks.
 - Treat an unknown input box or trust screen conservatively. Do not broaden a parser without negative fixtures.
 - Keep hook errors fail-open and side effects scoped; launch/authorization failures must not silently select a different agent identity.
+- Branch-history checks acquire local Git objects only in a disposable bare repository. Never fetch into or change the live installation; report incomplete ancestry as unavailable. Checkout history is not installed-binary provenance: an unverified installed commit cannot support an installed-ahead/equal/diverged claim.
 
 ## Work Guidance
 
